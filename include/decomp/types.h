@@ -68,6 +68,17 @@ struct StackFrameFacts
     bool FramePointer = false;
 };
 
+struct StackPointerFact
+{
+    uint64_t Site = 0;
+    int64_t DeltaBefore = 0;
+    int64_t DeltaAfter = 0;
+    int64_t FramePointerDelta = 0;
+    bool Known = false;
+    bool FramePointerKnown = false;
+    double Confidence = 0.0;
+};
+
 struct DisassembledInstruction
 {
     uint64_t Address = 0;
@@ -106,8 +117,16 @@ struct CallSite
 struct SwitchInfo
 {
     uint64_t Site = 0;
+    uint64_t TableAddress = 0;
     uint32_t CaseCount = 0;
+    uint64_t DefaultTarget = 0;
+    int64_t RangeMin = 0;
+    int64_t RangeMax = 0;
+    bool RangeKnown = false;
+    bool SignedIndex = false;
     std::string Detail;
+    std::string IndexExpression;
+    std::vector<uint64_t> CaseTargets;
 };
 
 struct MemoryAccess
@@ -122,6 +141,12 @@ struct MemoryAccess
     uint32_t Scale = 0;
     std::string Displacement;
     bool RipRelative = false;
+    bool Implicit = false;
+    std::string Semantic;
+    bool StackFrameRelative = false;
+    std::string FrameBase;
+    int64_t FrameOffset = 0;
+    int64_t StackPointerDelta = 0;
 };
 
 struct RecoveredArgument
@@ -140,6 +165,8 @@ struct RecoveredLocal
     std::string Name;
     std::string BaseRegister;
     int64_t Offset = 0;
+    std::string RawBaseRegister;
+    int64_t RawOffset = 0;
     std::string Storage;
     std::string TypeHint;
     std::string RoleHint;
@@ -147,6 +174,26 @@ struct RecoveredLocal
     uint64_t LastSite = 0;
     uint32_t ReadCount = 0;
     uint32_t WriteCount = 0;
+    double Confidence = 0.0;
+};
+
+struct CallArgumentFact
+{
+    uint64_t Site = 0;
+    uint32_t Ordinal = 0;
+    std::string Location;
+    std::string Expression;
+    std::string TypeHint;
+    std::string Source;
+    double Confidence = 0.0;
+};
+
+struct PrototypeParameter
+{
+    uint32_t Ordinal = 0;
+    std::string Name;
+    std::string Type;
+    std::string Location;
     double Confidence = 0.0;
 };
 
@@ -184,6 +231,11 @@ struct ControlFlowRegion
     std::vector<std::string> ExitBlocks;
     std::string Condition;
     std::string Evidence;
+    std::string InductionVariable;
+    std::string InitialValue;
+    std::string Step;
+    std::string Bound;
+    std::string Direction;
     double Confidence = 0.0;
 };
 
@@ -239,6 +291,8 @@ struct CalleeSummary
     std::string MemoryEffects;
     std::string Ownership;
     std::string Source;
+    std::vector<PrototypeParameter> Parameters;
+    bool TailCall = false;
     double Confidence = 0.0;
 };
 
@@ -265,7 +319,14 @@ struct CallTargetInfo
     std::string Prototype;
     std::string ReturnType;
     std::string SideEffects;
+    std::string MemoryEffects;
+    std::string Ownership;
+    std::string TargetExpression;
+    uint32_t VtableOffset = 0;
     bool Indirect = false;
+    bool TailCall = false;
+    bool VirtualCall = false;
+    std::vector<PrototypeParameter> Parameters;
     double Confidence = 0.0;
 };
 
@@ -329,6 +390,7 @@ struct PdbFacts
     std::string FunctionName;
     std::string Prototype;
     std::string ReturnType;
+    std::vector<PrototypeParameter> PrototypeParameters;
     std::vector<PdbScopedSymbol> Params;
     std::vector<PdbScopedSymbol> Locals;
     std::vector<PdbFieldHint> FieldHints;
@@ -405,9 +467,11 @@ struct AnalysisFacts
     std::vector<CallSite> Calls;
     std::vector<CallSite> IndirectCalls;
     std::vector<SwitchInfo> Switches;
+    std::vector<StackPointerFact> StackPointer;
     std::vector<MemoryAccess> MemoryAccesses;
     std::vector<RecoveredArgument> RecoveredArguments;
     std::vector<RecoveredLocal> RecoveredLocals;
+    std::vector<CallArgumentFact> CallArguments;
     std::vector<ValueMerge> ValueMerges;
     std::vector<IrValue> IrValues;
     std::vector<ControlFlowRegion> ControlFlow;

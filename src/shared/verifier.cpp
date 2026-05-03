@@ -1,10 +1,12 @@
 #include "decomp/verifier.h"
 
+#include <algorithm>
 #include <cctype>
 #include <exception>
 #include <set>
 #include <unordered_set>
 
+#include "decomp/pseudo_tokens.h"
 #include "decomp/string_utils.h"
 
 namespace decomp
@@ -56,18 +58,20 @@ bool GraphHasBackEdge(const AnalysisFacts& facts)
     return false;
 }
 
+bool HasCodeTokenText(const AnalyzeResponse& response, const std::string& value);
+
 bool MentionsLoop(const AnalyzeResponse& response)
 {
     return ContainsInsensitive(response.Summary, "loop")
-        || ContainsInsensitive(response.PseudoC, "for (")
-        || ContainsInsensitive(response.PseudoC, "while (")
-        || ContainsInsensitive(response.PseudoC, "do\n{");
+        || HasCodeTokenText(response, "for")
+        || HasCodeTokenText(response, "while")
+        || HasCodeTokenText(response, "do");
 }
 
 bool MentionsSwitch(const AnalyzeResponse& response)
 {
     return ContainsInsensitive(response.Summary, "switch")
-        || ContainsInsensitive(response.PseudoC, "switch (");
+        || HasCodeTokenText(response, "switch");
 }
 
 bool MentionsNoReturn(const AnalyzeResponse& response)
@@ -80,8 +84,8 @@ bool MentionsNoReturn(const AnalyzeResponse& response)
 
 bool MentionsBranch(const AnalyzeResponse& response)
 {
-    return ContainsInsensitive(response.PseudoC, "if (")
-        || ContainsInsensitive(response.PseudoC, "else")
+    return HasCodeTokenText(response, "if")
+        || HasCodeTokenText(response, "else")
         || ContainsInsensitive(response.Summary, "branch");
 }
 
@@ -174,6 +178,103 @@ std::string LowerNoSpace(std::string value)
     return compact;
 }
 
+bool IsTriviaOrLiteralToken(const PseudoCodeToken& token)
+{
+    return token.Kind == "whitespace"
+        || token.Kind == "newline"
+        || token.Kind == "comment"
+        || token.Kind == "string"
+        || token.Kind == "char"
+        || token.Kind == "preprocessor";
+}
+
+std::vector<PseudoCodeToken> CodeTokens(const AnalyzeResponse& response)
+{
+    std::vector<PseudoCodeToken> tokens;
+
+    for (const PseudoCodeToken& token : response.PseudoCTokens)
+    {
+        if (!IsTriviaOrLiteralToken(token))
+        {
+            tokens.push_back(token);
+        }
+    }
+
+    return tokens;
+}
+
+bool TokenTextEquals(const PseudoCodeToken& token, const std::string& value)
+{
+    return ToLowerAscii(token.Text) == ToLowerAscii(value);
+}
+
+bool HasCodeTokenText(const AnalyzeResponse& response, const std::string& value)
+{
+    for (const PseudoCodeToken& token : CodeTokens(response))
+    {
+        if (TokenTextEquals(token, value))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::vector<std::string> BuildSymbolCandidates(const std::string& symbol)
+{
+    std::vector<std::string> candidates;
+
+    auto addCandidate = [&candidates](std::string candidate)
+    {
+        candidate = TrimCopy(candidate);
+
+        if (!candidate.empty()
+            && std::find_if(
+                   candidates.begin(),
+                   candidates.end(),
+                   [&candidate](const std::string& existing)
+                   {
+                       return StartsWithInsensitive(existing, candidate) && existing.size() == candidate.size();
+                   })
+                == candidates.end())
+        {
+            candidates.push_back(candidate);
+        }
+    };
+
+    addCandidate(symbol);
+
+    const size_t bang = symbol.rfind('!');
+
+    if (bang != std::string::npos && bang + 1 < symbol.size())
+    {
+        addCandidate(symbol.substr(bang + 1));
+    }
+
+    for (size_t index = 0; index < candidates.size(); ++index)
+    {
+        std::string candidate = candidates[index];
+        const size_t candidateBang = candidate.rfind('!');
+
+        if (candidateBang != std::string::npos && candidateBang + 1 < candidate.size())
+        {
+            candidate = candidate.substr(candidateBang + 1);
+        }
+
+        if (StartsWithInsensitive(candidate, "__imp_"))
+        {
+            addCandidate(candidate.substr(6));
+        }
+        else if (StartsWithInsensitive(candidate, "_imp_"))
+        {
+            addCandidate(candidate.substr(5));
+        }
+    }
+
+    return candidates;
+}
+
 bool ContainsCallText(const AnalyzeResponse& response, const std::string& callee)
 {
     if (callee.empty())
@@ -181,9 +282,121 @@ bool ContainsCallText(const AnalyzeResponse& response, const std::string& callee
         return false;
     }
 
-    return ContainsInsensitive(response.PseudoC, callee + "(")
-        || ContainsInsensitive(response.PseudoC, callee)
-        || ContainsInsensitive(response.Summary, callee);
+    const std::vector<std::string> candidates = BuildSymbolCandidates(callee);
+    const std::vector<PseudoCodeToken> tokens = CodeTokens(response);
+
+    for (const std::string& candidate : candidates)
+    {
+        if (candidate.empty())
+        {
+            continue;
+        }
+
+        for (size_t index = 0; index < tokens.size(); ++index)
+        {
+            if (tokens[index].Kind == "function_name" && TokenTextEquals(tokens[index], candidate))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool TryCountCallArgumentsFromOpenParen(
+    const std::vector<PseudoCodeToken>& tokens,
+    size_t openParenIndex,
+    uint32_t& count)
+{
+    if (openParenIndex >= tokens.size() || tokens[openParenIndex].Text != "(")
+    {
+        return false;
+    }
+
+    count = 0;
+    size_t depth = 0;
+    bool sawArgumentToken = false;
+
+    for (size_t index = openParenIndex + 1U; index < tokens.size(); ++index)
+    {
+        const std::string& text = tokens[index].Text;
+
+        if (text == "(" || text == "[" || text == "{")
+        {
+            ++depth;
+            sawArgumentToken = true;
+            continue;
+        }
+
+        if (text == ")" || text == "]" || text == "}")
+        {
+            if (depth == 0)
+            {
+                if (sawArgumentToken)
+                {
+                    ++count;
+                }
+
+                return text == ")";
+            }
+
+            --depth;
+            sawArgumentToken = true;
+            continue;
+        }
+
+        if (text == "," && depth == 0)
+        {
+            if (sawArgumentToken)
+            {
+                ++count;
+                sawArgumentToken = false;
+            }
+
+            continue;
+        }
+
+        sawArgumentToken = true;
+    }
+
+    return false;
+}
+
+std::vector<uint32_t> FindCallArities(const AnalyzeResponse& response, const std::string& callee)
+{
+    std::vector<uint32_t> arities;
+    const std::vector<std::string> candidates = BuildSymbolCandidates(callee);
+    const std::vector<PseudoCodeToken> tokens = CodeTokens(response);
+
+    for (size_t index = 0; index + 1U < tokens.size(); ++index)
+    {
+        if (tokens[index].Kind != "function_name" || tokens[index + 1U].Text != "(")
+        {
+            continue;
+        }
+
+        bool matches = false;
+
+        for (const std::string& candidate : candidates)
+        {
+            matches = matches || TokenTextEquals(tokens[index], candidate);
+        }
+
+        if (!matches)
+        {
+            continue;
+        }
+
+        uint32_t arity = 0;
+
+        if (TryCountCallArgumentsFromOpenParen(tokens, index + 1U, arity))
+        {
+            arities.push_back(arity);
+        }
+    }
+
+    return arities;
 }
 
 bool LooksLikeAssignedCallResult(const AnalyzeResponse& response, const std::string& callee)
@@ -193,11 +406,43 @@ bool LooksLikeAssignedCallResult(const AnalyzeResponse& response, const std::str
         return false;
     }
 
-    const std::string pseudo = LowerNoSpace(response.PseudoC);
-    const std::string name = LowerNoSpace(callee);
+    const std::vector<std::string> candidates = BuildSymbolCandidates(callee);
+    const std::vector<PseudoCodeToken> tokens = CodeTokens(response);
 
-    return pseudo.find("=" + name + "(") != std::string::npos
-        || pseudo.find("=" + name) != std::string::npos;
+    for (size_t index = 0; index < tokens.size(); ++index)
+    {
+        if (tokens[index].Kind != "function_name" && tokens[index].Kind != "identifier")
+        {
+            continue;
+        }
+
+        bool matches = false;
+
+        for (const std::string& candidate : candidates)
+        {
+            matches = matches || TokenTextEquals(tokens[index], candidate);
+        }
+
+        if (!matches)
+        {
+            continue;
+        }
+
+        for (size_t cursor = index; cursor > 0 && index - cursor < 8; --cursor)
+        {
+            if (tokens[cursor - 1U].Kind == "operator" && tokens[cursor - 1U].Text == "=")
+            {
+                return true;
+            }
+
+            if (tokens[cursor - 1U].Text == ";" || tokens[cursor - 1U].Text == "{" || tokens[cursor - 1U].Text == "}")
+            {
+                break;
+            }
+        }
+    }
+
+    return false;
 }
 
 uint32_t CountConditionalBranches(const AnalysisFacts& facts)
@@ -218,12 +463,45 @@ uint32_t CountConditionalBranches(const AnalysisFacts& facts)
 uint32_t CountPseudoIfs(const AnalyzeResponse& response)
 {
     uint32_t count = 0;
-    size_t offset = 0;
 
-    while ((offset = response.PseudoC.find("if (", offset)) != std::string::npos)
+    for (const PseudoCodeToken& token : CodeTokens(response))
     {
-        ++count;
-        offset += 4;
+        if (TokenTextEquals(token, "if"))
+        {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+uint32_t CountPseudoSwitchCases(const AnalyzeResponse& response)
+{
+    uint32_t count = 0;
+
+    for (const PseudoCodeToken& token : CodeTokens(response))
+    {
+        if (TokenTextEquals(token, "case"))
+        {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+uint32_t CountRecoveredSwitchTargets(const AnalysisFacts& facts)
+{
+    uint32_t count = 0;
+
+    for (const auto& switchInfo : facts.Switches)
+    {
+        count += static_cast<uint32_t>(switchInfo.CaseTargets.size());
+
+        if (switchInfo.DefaultTarget != 0)
+        {
+            ++count;
+        }
     }
 
     return count;
@@ -285,6 +563,440 @@ void CheckPseudoBranchDensity(const AnalyzeRequest& request, const AnalyzeRespon
             "pseudo_c contains more branch expressions than recovered CFG branch evidence",
             "pseudo_if_count=" + std::to_string(pseudoIfs) + " cfg_conditional_branches=" + std::to_string(analyzerBranches));
     }
+
+    if (analyzerBranches >= 4 && pseudoIfs + 1 < analyzerBranches / 2 && response.Confidence > 0.65)
+    {
+        AddIssue(
+            report,
+            "branch.too_few_pseudo_conditions",
+            "warning",
+            "pseudo_c contains far fewer branch expressions than recovered CFG branch evidence",
+            "pseudo_if_count=" + std::to_string(pseudoIfs) + " cfg_conditional_branches=" + std::to_string(analyzerBranches));
+    }
+}
+
+void CheckSwitchEvidenceConsistency(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
+{
+    if (!MentionsSwitch(response) || request.Facts.Switches.empty())
+    {
+        return;
+    }
+
+    const uint32_t recoveredTargets = CountRecoveredSwitchTargets(request.Facts);
+    uint32_t maxEstimatedCases = 0;
+
+    for (const auto& switchInfo : request.Facts.Switches)
+    {
+        maxEstimatedCases = (std::max)(maxEstimatedCases, switchInfo.CaseCount);
+    }
+
+    if (recoveredTargets == 0 && maxEstimatedCases == 0 && response.Confidence > 0.60)
+    {
+        AddIssue(
+            report,
+            "control_flow.switch_without_case_evidence",
+            "warning",
+            "switch mentioned but analyzer has no recovered or estimated case evidence");
+    }
+
+    const uint32_t pseudoCases = CountPseudoSwitchCases(response);
+
+    if (recoveredTargets != 0 && pseudoCases > recoveredTargets + 2)
+    {
+        AddIssue(
+            report,
+            "control_flow.too_many_switch_cases",
+            "warning",
+            "pseudo_c contains more switch cases than recovered jump-table targets",
+            "pseudo_cases=" + std::to_string(pseudoCases) + " recovered_targets=" + std::to_string(recoveredTargets));
+    }
+}
+
+void CheckRecoveredCallCoverage(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
+{
+    if (response.Confidence <= 0.65)
+    {
+        return;
+    }
+
+    size_t missingHighConfidenceCalls = 0;
+
+    for (const auto& call : request.Facts.CallTargets)
+    {
+        if (call.DisplayName.empty() || call.Confidence < 0.65)
+        {
+            continue;
+        }
+
+        if (!ContainsCallText(response, call.DisplayName))
+        {
+            ++missingHighConfidenceCalls;
+        }
+    }
+
+    if (missingHighConfidenceCalls != 0)
+    {
+        AddIssue(
+            report,
+            "call.recovered_targets_omitted",
+            "warning",
+            "pseudo_c omits one or more high-confidence recovered call targets",
+            "missing_high_confidence_calls=" + std::to_string(missingHighConfidenceCalls));
+    }
+}
+
+uint32_t RecoveredCallArgumentArityAtSite(const AnalysisFacts& facts, uint64_t site)
+{
+    uint32_t arity = 0;
+
+    for (const CallArgumentFact& argument : facts.CallArguments)
+    {
+        if (argument.Site == site && argument.Confidence >= 0.55)
+        {
+            arity = (std::max)(arity, argument.Ordinal);
+        }
+    }
+
+    return arity;
+}
+
+uint32_t PrototypeParameterArity(const std::vector<PrototypeParameter>& parameters)
+{
+    uint32_t arity = 0;
+
+    for (const PrototypeParameter& parameter : parameters)
+    {
+        if (parameter.Type == "..." || parameter.Name == "varargs")
+        {
+            continue;
+        }
+
+        arity = (std::max)(arity, parameter.Ordinal);
+    }
+
+    return arity;
+}
+
+void CheckRecoveredCallArgumentConsistency(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
+{
+    if (response.Confidence <= 0.65)
+    {
+        return;
+    }
+
+    size_t suspiciousCalls = 0;
+    std::set<uint64_t> checkedSites;
+
+    for (const CallTargetInfo& call : request.Facts.CallTargets)
+    {
+        if (call.DisplayName.empty() || call.Confidence < 0.65)
+        {
+            continue;
+        }
+
+        const uint32_t recoveredArity = RecoveredCallArgumentArityAtSite(request.Facts, call.Site);
+        const uint32_t prototypeArity = PrototypeParameterArity(call.Parameters);
+        const uint32_t expectedArity = (std::max)(recoveredArity, prototypeArity);
+
+        if (expectedArity == 0)
+        {
+            continue;
+        }
+
+        const std::vector<uint32_t> pseudoArities = FindCallArities(response, call.DisplayName);
+
+        if (pseudoArities.empty())
+        {
+            continue;
+        }
+
+        const uint32_t maxPseudoArity = *std::max_element(pseudoArities.begin(), pseudoArities.end());
+
+        if (maxPseudoArity < expectedArity)
+        {
+            ++suspiciousCalls;
+        }
+
+        checkedSites.insert(call.Site);
+    }
+
+    for (const CalleeSummary& summary : request.Facts.CalleeSummaries)
+    {
+        if (summary.Callee.empty()
+            || summary.Confidence < 0.65
+            || checkedSites.find(summary.Site) != checkedSites.end())
+        {
+            continue;
+        }
+
+        const uint32_t expectedArity = PrototypeParameterArity(summary.Parameters);
+
+        if (expectedArity == 0)
+        {
+            continue;
+        }
+
+        const std::vector<uint32_t> pseudoArities = FindCallArities(response, summary.Callee);
+
+        if (pseudoArities.empty())
+        {
+            continue;
+        }
+
+        const uint32_t maxPseudoArity = *std::max_element(pseudoArities.begin(), pseudoArities.end());
+
+        if (maxPseudoArity < expectedArity)
+        {
+            ++suspiciousCalls;
+        }
+    }
+
+    if (suspiciousCalls != 0)
+    {
+        AddIssue(
+            report,
+            "call.arguments_omitted",
+            "warning",
+            "pseudo_c calls recovered callees with fewer arguments than recovered call-site or prototype facts",
+            "calls_with_too_few_arguments=" + std::to_string(suspiciousCalls));
+        ++report.MissingEvidence;
+    }
+}
+
+bool IsKnownResponseName(const AnalyzeRequest& request, const std::string& name)
+{
+    if (name.empty())
+    {
+        return true;
+    }
+
+    for (const auto& argument : request.Facts.RecoveredArguments)
+    {
+        if (argument.Name == name || argument.Register == name)
+        {
+            return true;
+        }
+    }
+
+    for (const auto& local : request.Facts.RecoveredLocals)
+    {
+        if (local.Name == name)
+        {
+            return true;
+        }
+    }
+
+    for (const auto& param : request.Facts.Pdb.Params)
+    {
+        if (param.Name == name)
+        {
+            return true;
+        }
+    }
+
+    for (const auto& param : request.Facts.Pdb.PrototypeParameters)
+    {
+        if (param.Name == name)
+        {
+            return true;
+        }
+    }
+
+    for (const auto& local : request.Facts.Pdb.Locals)
+    {
+        if (local.Name == name)
+        {
+            return true;
+        }
+    }
+
+    auto hasNumericSuffix = [&name](const std::string& prefix)
+    {
+        if (!StartsWithInsensitive(name, prefix) || name.size() <= prefix.size())
+        {
+            return false;
+        }
+
+        for (size_t index = prefix.size(); index < name.size(); ++index)
+        {
+            if (std::isdigit(static_cast<unsigned char>(name[index])) == 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    return hasNumericSuffix("arg")
+        || hasNumericSuffix("v")
+        || StartsWithInsensitive(name, "local_")
+        || StartsWithInsensitive(name, "slot_")
+        || StartsWithInsensitive(name, "tmp");
+}
+
+void CheckResponseNameGrounding(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
+{
+    if (response.Confidence <= 0.65)
+    {
+        return;
+    }
+
+    size_t unknownNames = 0;
+
+    for (const auto& param : response.Params)
+    {
+        if (!IsKnownResponseName(request, param.Name))
+        {
+            ++unknownNames;
+        }
+    }
+
+    for (const auto& local : response.Locals)
+    {
+        if (!IsKnownResponseName(request, local.Name))
+        {
+            ++unknownNames;
+        }
+    }
+
+    if (unknownNames != 0)
+    {
+        AddIssue(
+            report,
+            "identifier.ungrounded_declared_names",
+            "warning",
+            "response declares parameter or local names not grounded in recovered analyzer or PDB facts",
+            "ungrounded_names=" + std::to_string(unknownNames));
+    }
+}
+
+std::string FindBlockIdContainingSite(const AnalysisFacts& facts, uint64_t site)
+{
+    for (const BasicBlock& block : facts.Blocks)
+    {
+        if (site >= block.StartAddress && site < block.EndAddress)
+        {
+            return block.Id;
+        }
+    }
+
+    return std::string();
+}
+
+std::set<std::string> BuildEvidenceBlockSet(const AnalyzeResponse& response)
+{
+    std::set<std::string> blocks;
+
+    for (const EvidenceItem& evidence : response.Evidence)
+    {
+        for (const std::string& blockId : evidence.Blocks)
+        {
+            blocks.insert(blockId);
+        }
+    }
+
+    return blocks;
+}
+
+void AddRequiredEvidenceBlock(std::set<std::string>& blocks, const std::string& blockId)
+{
+    if (!blockId.empty())
+    {
+        blocks.insert(blockId);
+    }
+}
+
+void CheckEvidenceCoverage(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
+{
+    if (response.Confidence <= 0.70 || response.Evidence.empty() || request.Facts.Blocks.size() < 3)
+    {
+        return;
+    }
+
+    std::set<std::string> requiredBlocks;
+
+    if (!request.Facts.Blocks.empty())
+    {
+        AddRequiredEvidenceBlock(requiredBlocks, request.Facts.Blocks.front().Id);
+    }
+
+    for (const NormalizedCondition& condition : request.Facts.NormalizedConditions)
+    {
+        AddRequiredEvidenceBlock(requiredBlocks, condition.BlockId);
+    }
+
+    for (const ControlFlowRegion& region : request.Facts.ControlFlow)
+    {
+        if (region.Confidence < 0.55)
+        {
+            continue;
+        }
+
+        AddRequiredEvidenceBlock(requiredBlocks, region.HeaderBlock);
+
+        for (const std::string& blockId : region.LatchBlocks)
+        {
+            AddRequiredEvidenceBlock(requiredBlocks, blockId);
+        }
+
+        for (const std::string& blockId : region.ExitBlocks)
+        {
+            AddRequiredEvidenceBlock(requiredBlocks, blockId);
+        }
+    }
+
+    for (const SwitchInfo& info : request.Facts.Switches)
+    {
+        AddRequiredEvidenceBlock(requiredBlocks, FindBlockIdContainingSite(request.Facts, info.Site));
+
+        for (const uint64_t target : info.CaseTargets)
+        {
+            AddRequiredEvidenceBlock(requiredBlocks, FindBlockIdContainingSite(request.Facts, target));
+        }
+    }
+
+    for (const CallTargetInfo& call : request.Facts.CallTargets)
+    {
+        if (call.Confidence >= 0.65)
+        {
+            AddRequiredEvidenceBlock(requiredBlocks, FindBlockIdContainingSite(request.Facts, call.Site));
+        }
+    }
+
+    for (const DisassembledInstruction& instruction : request.Facts.Instructions)
+    {
+        if (instruction.IsReturn || instruction.IsConditionalBranch)
+        {
+            AddRequiredEvidenceBlock(requiredBlocks, FindBlockIdContainingSite(request.Facts, instruction.Address));
+        }
+    }
+
+    if (requiredBlocks.size() < 3)
+    {
+        return;
+    }
+
+    const std::set<std::string> evidencedBlocks = BuildEvidenceBlockSet(response);
+    size_t covered = 0;
+
+    for (const std::string& blockId : requiredBlocks)
+    {
+        covered += evidencedBlocks.find(blockId) != evidencedBlocks.end() ? 1U : 0U;
+    }
+
+    const double coverage = static_cast<double>(covered) / static_cast<double>(requiredBlocks.size());
+
+    if (coverage < 0.45)
+    {
+        ++report.MissingEvidence;
+        AddIssue(
+            report,
+            "evidence.low_coverage",
+            "warning",
+            "response evidence covers too few high-signal analyzer blocks for its confidence",
+            "covered=" + std::to_string(covered) + " required=" + std::to_string(requiredBlocks.size()));
+    }
 }
 
 void CheckCalleeSummaryConsistency(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
@@ -334,39 +1046,18 @@ void CheckCalleeSummaryConsistency(const AnalyzeRequest& request, const AnalyzeR
     }
 }
 
-std::vector<std::string> ExtractIdentifiers(const std::string& text)
+std::vector<std::string> ExtractIdentifiers(const AnalyzeResponse& response)
 {
     std::vector<std::string> identifiers;
-    std::string current;
 
-    auto flush = [&identifiers, &current]()
+    for (const PseudoCodeToken& token : CodeTokens(response))
     {
-        if (current.empty())
+        if (token.Kind == "identifier" || token.Kind == "function_name")
         {
-            return;
-        }
-
-        if (std::isalpha(static_cast<unsigned char>(current.front())) != 0 || current.front() == '_')
-        {
-            identifiers.push_back(current);
-        }
-
-        current.clear();
-    };
-
-    for (char ch : text)
-    {
-        if (std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_')
-        {
-            current.push_back(ch);
-        }
-        else
-        {
-            flush();
+            identifiers.push_back(token.Text);
         }
     }
 
-    flush();
     return identifiers;
 }
 
@@ -404,7 +1095,7 @@ bool LooksLikeUseBeforeDef(const AnalyzeRequest& request, const AnalyzeResponse&
 
     size_t suspicious = 0;
 
-    for (const std::string& identifier : ExtractIdentifiers(response.PseudoC))
+    for (const std::string& identifier : ExtractIdentifiers(response))
     {
         if (identifier.size() < 3
             || keywords.find(identifier) != keywords.end()
@@ -435,6 +1126,8 @@ bool LooksLikeUseBeforeDef(const AnalyzeRequest& request, const AnalyzeResponse&
 
 VerifyReport VerifyResponse(const AnalyzeRequest& request, AnalyzeResponse& response)
 {
+    EnsurePseudoCodeTokens(response);
+
     VerifyReport report;
     report.SchemaOk = !response.Status.empty() && (!response.PseudoC.empty() || !response.Summary.empty());
 
@@ -464,7 +1157,12 @@ VerifyReport VerifyResponse(const AnalyzeRequest& request, AnalyzeResponse& resp
 
     CheckBranchTargetEdges(request, report);
     CheckPseudoBranchDensity(request, response, report);
+    CheckSwitchEvidenceConsistency(request, response, report);
     CheckCalleeSummaryConsistency(request, response, report);
+    CheckRecoveredCallCoverage(request, response, report);
+    CheckRecoveredCallArgumentConsistency(request, response, report);
+    CheckResponseNameGrounding(request, response, report);
+    CheckEvidenceCoverage(request, response, report);
 
     if (MentionsLoop(response) && !GraphHasBackEdge(request.Facts))
     {
@@ -556,4 +1254,3 @@ VerifyReport VerifyResponse(const AnalyzeRequest& request, AnalyzeResponse& resp
     return report;
 }
 }
-

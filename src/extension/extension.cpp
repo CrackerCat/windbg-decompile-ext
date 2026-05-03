@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -65,7 +66,14 @@ struct DecodedInstructionContext
     bool HasBranchTarget = false;
     uint64_t BranchTarget = 0;
     bool IsCall = false;
+    bool IsUnconditionalBranch = false;
     bool IsIndirect = false;
+};
+
+struct FunctionRegionBytes
+{
+    decomp::FunctionRegion Region;
+    std::vector<uint8_t> Bytes;
 };
 
 struct SymbolLookupResult
@@ -1917,6 +1925,254 @@ uint64_t DisassembleUntilTerminal(IDebugControl* control, uint64_t entryAddress,
     return lastEnd;
 }
 
+bool IsConditionalJumpMnemonic(const std::string& mnemonic)
+{
+    return mnemonic.size() >= 2 && mnemonic[0] == 'j' && mnemonic != "jmp";
+}
+
+bool TryParseFallbackBranchTarget(const std::string& operandText, uint64_t& target)
+{
+    if (operandText.empty() || operandText.find('[') != std::string::npos)
+    {
+        return false;
+    }
+
+    std::vector<std::string> tokens;
+    std::string current;
+
+    auto flush = [&]()
+    {
+        const std::string token = decomp::TrimCopy(current);
+        current.clear();
+
+        if (!token.empty())
+        {
+            tokens.push_back(token);
+        }
+    };
+
+    for (char ch : operandText)
+    {
+        if (std::isspace(static_cast<unsigned char>(ch)) != 0 || ch == ',')
+        {
+            flush();
+            continue;
+        }
+
+        current.push_back(ch);
+    }
+
+    flush();
+
+    for (auto it = tokens.rbegin(); it != tokens.rend(); ++it)
+    {
+        std::string token = *it;
+
+        while (!token.empty() && (token.back() == ':' || token.back() == ')' || token.back() == '('))
+        {
+            token.pop_back();
+        }
+
+        if (decomp::StartsWithInsensitive(token, "short")
+            || decomp::StartsWithInsensitive(token, "near")
+            || decomp::StartsWithInsensitive(token, "far"))
+        {
+            continue;
+        }
+
+        if (decomp::TryParseUnsigned(token, target))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool IsFallbackTraversalAddressAllowed(
+    const decomp::ModuleInfo& moduleInfo,
+    uint64_t entryAddress,
+    uint64_t address)
+{
+    if (address == 0)
+    {
+        return false;
+    }
+
+    const uint64_t lowerBound = entryAddress > 0x10000ULL ? entryAddress - 0x10000ULL : 0;
+    const uint64_t upperBound = entryAddress > (std::numeric_limits<uint64_t>::max)() - 0x100000ULL
+        ? (std::numeric_limits<uint64_t>::max)()
+        : entryAddress + 0x100000ULL;
+
+    if (address < lowerBound || address >= upperBound)
+    {
+        return false;
+    }
+
+    if (moduleInfo.Base != 0 && moduleInfo.Size != 0)
+    {
+        const uint64_t moduleEnd = moduleInfo.Base > (std::numeric_limits<uint64_t>::max)() - moduleInfo.Size
+            ? (std::numeric_limits<uint64_t>::max)()
+            : moduleInfo.Base + moduleInfo.Size;
+        return address >= moduleInfo.Base && address < moduleEnd;
+    }
+
+    return true;
+}
+
+bool TryDisassembleFallbackInstruction(
+    IDebugControl* control,
+    uint64_t address,
+    decomp::DisassembledInstruction& instruction)
+{
+    std::array<char, 1024> buffer = {};
+    ULONG disassemblySize = 0;
+    ULONG64 nextAddress = 0;
+
+    if (control == nullptr
+        || FAILED(control->Disassemble(address, 0, buffer.data(), static_cast<ULONG>(buffer.size()), &disassemblySize, &nextAddress))
+        || nextAddress <= address)
+    {
+        return false;
+    }
+
+    instruction.Address = address;
+    instruction.EndAddress = nextAddress;
+    instruction.Text = buffer.data();
+    instruction.OperationText = ExtractOperationText(buffer.data());
+    instruction.Mnemonic = ExtractMnemonic(instruction.OperationText);
+    instruction.OperandText = ExtractOperandText(instruction.OperationText);
+    instruction.IsConditionalBranch = IsConditionalJumpMnemonic(instruction.Mnemonic);
+    instruction.IsUnconditionalBranch = IsUnconditionalJumpMnemonic(instruction.Mnemonic);
+    instruction.IsCall = IsCallMnemonic(instruction.Mnemonic);
+    instruction.IsReturn = IsReturnMnemonic(instruction.Mnemonic);
+    instruction.IsIndirect = instruction.OperandText.find('[') != std::string::npos
+        && (instruction.IsCall || instruction.IsConditionalBranch || instruction.IsUnconditionalBranch);
+    instruction.HasBranchTarget = TryParseFallbackBranchTarget(instruction.OperandText, instruction.BranchTarget);
+    return true;
+}
+
+bool TryRecoverBranchFollowRegions(
+    IDebugControl* control,
+    uint64_t entryAddress,
+    const decomp::ModuleInfo& moduleInfo,
+    uint32_t maxInstructions,
+    std::vector<decomp::FunctionRegion>& regions)
+{
+    regions.clear();
+
+    if (control == nullptr || maxInstructions == 0)
+    {
+        return false;
+    }
+
+    std::deque<uint64_t> pending;
+    std::set<uint64_t> queued;
+    std::set<uint64_t> visited;
+    std::vector<decomp::FunctionRegion> ranges;
+    pending.push_back(entryAddress);
+    queued.insert(entryAddress);
+
+    while (!pending.empty() && visited.size() < maxInstructions)
+    {
+        const uint64_t address = pending.front();
+        pending.pop_front();
+
+        if (visited.find(address) != visited.end()
+            || !IsFallbackTraversalAddressAllowed(moduleInfo, entryAddress, address))
+        {
+            continue;
+        }
+
+        decomp::DisassembledInstruction instruction;
+
+        if (!TryDisassembleFallbackInstruction(control, address, instruction))
+        {
+            continue;
+        }
+
+        visited.insert(address);
+        ranges.push_back({ instruction.Address, instruction.EndAddress });
+
+        auto enqueue = [&](uint64_t target)
+        {
+            if (visited.size() + pending.size() >= maxInstructions)
+            {
+                return;
+            }
+
+            if (queued.find(target) == queued.end()
+                && visited.find(target) == visited.end()
+                && IsFallbackTraversalAddressAllowed(moduleInfo, entryAddress, target))
+            {
+                queued.insert(target);
+                pending.push_back(target);
+            }
+        };
+
+        if (instruction.IsConditionalBranch)
+        {
+            if (instruction.HasBranchTarget)
+            {
+                enqueue(instruction.BranchTarget);
+            }
+
+            enqueue(instruction.EndAddress);
+            continue;
+        }
+
+        if (instruction.IsUnconditionalBranch)
+        {
+            if (instruction.HasBranchTarget && !instruction.IsIndirect)
+            {
+                enqueue(instruction.BranchTarget);
+            }
+
+            continue;
+        }
+
+        if (instruction.IsReturn || IsTrapMnemonic(instruction.Mnemonic))
+        {
+            continue;
+        }
+
+        if (instruction.IsCall && IsNoReturnTarget(instruction.OperandText))
+        {
+            continue;
+        }
+
+        enqueue(instruction.EndAddress);
+    }
+
+    if (ranges.empty())
+    {
+        return false;
+    }
+
+    std::sort(
+        ranges.begin(),
+        ranges.end(),
+        [](const decomp::FunctionRegion& left, const decomp::FunctionRegion& right)
+        {
+            return left.Start < right.Start;
+        });
+
+    for (const decomp::FunctionRegion& range : ranges)
+    {
+        if (!regions.empty() && range.Start <= regions.back().End)
+        {
+            regions.back().End = (std::max)(regions.back().End, range.End);
+        }
+        else
+        {
+            regions.push_back(range);
+        }
+    }
+
+    NormalizeRegions(regions);
+    return !regions.empty();
+}
+
 std::vector<decomp::FunctionRegion> RecoverFunctionRegions(
     IDebugSymbols3* symbols,
     IDebugControl* control,
@@ -1960,12 +2216,15 @@ std::vector<decomp::FunctionRegion> RecoverFunctionRegions(
         entryAddress = queryAddress - displacement;
     }
 
-    std::vector<decomp::DisassembledInstruction> probe;
-    const uint64_t endAddress = DisassembleUntilTerminal(control, entryAddress, maxInstructions, probe);
-
-    if (endAddress > entryAddress)
+    if (!TryRecoverBranchFollowRegions(control, entryAddress, moduleInfo, maxInstructions, regions))
     {
-        regions.push_back({ entryAddress, endAddress });
+        std::vector<decomp::DisassembledInstruction> probe;
+        const uint64_t endAddress = DisassembleUntilTerminal(control, entryAddress, maxInstructions, probe);
+
+        if (endAddress > entryAddress)
+        {
+            regions.push_back({ entryAddress, endAddress });
+        }
     }
 
     NormalizeRegions(regions);
@@ -2008,9 +2267,9 @@ bool ReadVirtualRange(IDebugDataSpaces4* dataSpaces, uint64_t start, uint64_t en
     return success;
 }
 
-std::vector<uint8_t> ReadFunctionBytes(IDebugDataSpaces4* dataSpaces, const std::vector<decomp::FunctionRegion>& regions)
+std::vector<FunctionRegionBytes> ReadFunctionRegionBytes(IDebugDataSpaces4* dataSpaces, const std::vector<decomp::FunctionRegion>& regions)
 {
-    std::vector<uint8_t> combined;
+    std::vector<FunctionRegionBytes> regionBytes;
 
     for (const auto& region : regions)
     {
@@ -2021,7 +2280,22 @@ std::vector<uint8_t> ReadFunctionBytes(IDebugDataSpaces4* dataSpaces, const std:
             continue;
         }
 
-        combined.insert(combined.end(), part.begin(), part.end());
+        FunctionRegionBytes item;
+        item.Region = region;
+        item.Bytes = std::move(part);
+        regionBytes.push_back(std::move(item));
+    }
+
+    return regionBytes;
+}
+
+std::vector<uint8_t> FlattenFunctionRegionBytes(const std::vector<FunctionRegionBytes>& regionBytes)
+{
+    std::vector<uint8_t> combined;
+
+    for (const FunctionRegionBytes& item : regionBytes)
+    {
+        combined.insert(combined.end(), item.Bytes.begin(), item.Bytes.end());
     }
 
     return combined;
@@ -2060,6 +2334,7 @@ bool TryDecodeInstructionWithZydis(
     context.Mnemonic = instruction.Mnemonic;
     context.Operands = SplitOperands(instruction.OperandText);
     context.IsCall = instruction.IsCall;
+    context.IsUnconditionalBranch = instruction.IsUnconditionalBranch;
     context.IsIndirect = false;
     context.HasBranchTarget = false;
     context.BranchTarget = 0;
@@ -2110,33 +2385,30 @@ bool TryDecodeInstructionWithZydis(
 }
 
 std::vector<decomp::DisassembledInstruction> DisassembleRegions(
-    IDebugDataSpaces4* dataSpaces,
     IDebugControl* control,
-    const std::vector<decomp::FunctionRegion>& regions,
+    const std::vector<FunctionRegionBytes>& regionBytes,
     uint32_t maxInstructions,
     std::vector<DecodedInstructionContext>& decodedContexts)
 {
     std::vector<decomp::DisassembledInstruction> instructions;
     uint32_t remaining = maxInstructions;
 
-    for (const auto& region : regions)
+    for (const FunctionRegionBytes& regionData : regionBytes)
     {
-        std::vector<uint8_t> regionBytes;
-
-        if (!ReadVirtualRange(dataSpaces, region.Start, region.End, regionBytes))
+        if (regionData.Bytes.empty())
         {
             continue;
         }
 
-        uint64_t current = region.Start;
+        uint64_t current = regionData.Region.Start;
         size_t offset = 0;
 
-        while (current < region.End && remaining > 0 && offset < regionBytes.size())
+        while (current < regionData.Region.End && remaining > 0 && offset < regionData.Bytes.size())
         {
             decomp::DisassembledInstruction instruction;
             DecodedInstructionContext context;
 
-            if (TryDecodeInstructionWithZydis(current, regionBytes.data() + offset, regionBytes.size() - offset, instruction, context))
+            if (TryDecodeInstructionWithZydis(current, regionData.Bytes.data() + offset, regionData.Bytes.size() - offset, instruction, context))
             {
                 instructions.push_back(instruction);
                 decodedContexts.push_back(context);
@@ -2160,12 +2432,25 @@ std::vector<decomp::DisassembledInstruction> DisassembleRegions(
             instruction.Address = current;
             instruction.EndAddress = nextAddress;
             instruction.Text = buffer.data();
-            instruction.OperationText = buffer.data();
-            instruction.OperandText = ExtractOperandTextFromFormattedInstruction(buffer.data());
+            instruction.OperationText = ExtractOperationText(buffer.data());
+            instruction.Mnemonic = ExtractMnemonic(instruction.OperationText);
+            instruction.OperandText = ExtractOperandText(instruction.OperationText);
+            instruction.IsConditionalBranch = IsConditionalJumpMnemonic(instruction.Mnemonic);
+            instruction.IsUnconditionalBranch = IsUnconditionalJumpMnemonic(instruction.Mnemonic);
+            instruction.IsCall = IsCallMnemonic(instruction.Mnemonic);
+            instruction.IsReturn = IsReturnMnemonic(instruction.Mnemonic);
+            instruction.IsIndirect = instruction.OperandText.find('[') != std::string::npos
+                && (instruction.IsCall || instruction.IsConditionalBranch || instruction.IsUnconditionalBranch);
+            instruction.HasBranchTarget = TryParseFallbackBranchTarget(instruction.OperandText, instruction.BranchTarget);
             context.Address = current;
             context.EndAddress = nextAddress;
-            context.Mnemonic.clear();
+            context.Mnemonic = instruction.Mnemonic;
             context.Operands = SplitOperands(instruction.OperandText);
+            context.IsCall = instruction.IsCall;
+            context.IsUnconditionalBranch = instruction.IsUnconditionalBranch;
+            context.IsIndirect = instruction.IsIndirect;
+            context.HasBranchTarget = instruction.HasBranchTarget;
+            context.BranchTarget = instruction.BranchTarget;
             instructions.push_back(instruction);
             decodedContexts.push_back(context);
             --remaining;
@@ -2390,6 +2675,454 @@ bool IsAddressInRegions(uint64_t address, const std::vector<decomp::FunctionRegi
     return false;
 }
 
+bool TryAddSwitchTargetRegions(
+    IDebugControl* control,
+    const decomp::ModuleInfo& moduleInfo,
+    const decomp::AnalysisFacts& facts,
+    uint32_t maxInstructions,
+    std::vector<decomp::FunctionRegion>& regions,
+    size_t& addedRegions)
+{
+    addedRegions = 0;
+
+    if (control == nullptr || maxInstructions == 0)
+    {
+        return false;
+    }
+
+    std::vector<uint64_t> targets;
+
+    for (const decomp::SwitchInfo& switchInfo : facts.Switches)
+    {
+        for (const uint64_t target : switchInfo.CaseTargets)
+        {
+            if (target == 0
+                || IsAddressInRegions(target, regions)
+                || !IsFallbackTraversalAddressAllowed(moduleInfo, facts.EntryAddress, target)
+                || std::find(targets.begin(), targets.end(), target) != targets.end())
+            {
+                continue;
+            }
+
+            targets.push_back(target);
+        }
+    }
+
+    if (targets.empty())
+    {
+        return false;
+    }
+
+    std::vector<decomp::FunctionRegion> expanded = regions;
+    const uint32_t perTargetInstructionLimit = (std::max<uint32_t>)(16, (std::min<uint32_t>)(96, maxInstructions / 8U));
+
+    for (const uint64_t target : targets)
+    {
+        std::vector<decomp::FunctionRegion> recovered;
+
+        if (!TryRecoverBranchFollowRegions(control, target, moduleInfo, perTargetInstructionLimit, recovered))
+        {
+            continue;
+        }
+
+        for (const decomp::FunctionRegion& region : recovered)
+        {
+            if (region.Start >= region.End
+                || IsAddressInRegions(region.Start, expanded)
+                || !IsFallbackTraversalAddressAllowed(moduleInfo, facts.EntryAddress, region.Start))
+            {
+                continue;
+            }
+
+            expanded.push_back(region);
+            ++addedRegions;
+        }
+    }
+
+    if (addedRegions == 0)
+    {
+        return false;
+    }
+
+    NormalizeRegions(expanded);
+    regions = std::move(expanded);
+    return true;
+}
+
+const decomp::MemoryAccess* FindMemoryAccessAtSite(const decomp::AnalysisFacts& facts, uint64_t site)
+{
+    for (const decomp::MemoryAccess& access : facts.MemoryAccesses)
+    {
+        if (access.Site == site)
+        {
+            return &access;
+        }
+    }
+
+    return nullptr;
+}
+
+const DecodedInstructionContext* FindDecodedContextAtSite(const std::vector<DecodedInstructionContext>& contexts, uint64_t site)
+{
+    for (const DecodedInstructionContext& context : contexts)
+    {
+        if (context.Address == site)
+        {
+            return &context;
+        }
+    }
+
+    return nullptr;
+}
+
+bool TryReadU32Value(IDebugDataSpaces4* dataSpaces, uint64_t address, uint32_t& value)
+{
+    std::vector<uint8_t> bytes;
+
+    if (!ReadVirtualPrefix(dataSpaces, address, sizeof(uint32_t), bytes) || bytes.size() < sizeof(uint32_t))
+    {
+        return false;
+    }
+
+    value = static_cast<uint32_t>(bytes[0])
+        | (static_cast<uint32_t>(bytes[1]) << 8)
+        | (static_cast<uint32_t>(bytes[2]) << 16)
+        | (static_cast<uint32_t>(bytes[3]) << 24);
+    return true;
+}
+
+bool IsLikelyCodeAddress(
+    const decomp::ModuleInfo& moduleInfo,
+    const std::vector<decomp::FunctionRegion>& regions,
+    uint64_t address)
+{
+    if (IsAddressInRegions(address, regions))
+    {
+        return true;
+    }
+
+    return moduleInfo.Base != 0
+        && moduleInfo.Size != 0
+        && address >= moduleInfo.Base
+        && address < moduleInfo.Base + moduleInfo.Size;
+}
+
+void AppendUniqueAddress(std::vector<uint64_t>& values, uint64_t value)
+{
+    if (value == 0)
+    {
+        return;
+    }
+
+    if (std::find(values.begin(), values.end(), value) == values.end())
+    {
+        values.push_back(value);
+    }
+}
+
+std::string BuildSwitchIndexExpression(const decomp::MemoryAccess& access)
+{
+    std::string expression;
+
+    if (!access.BaseRegister.empty() && access.BaseRegister != "rip")
+    {
+        expression = access.BaseRegister;
+    }
+
+    if (!access.IndexRegister.empty())
+    {
+        if (!expression.empty())
+        {
+            expression += "+";
+        }
+
+        expression += access.IndexRegister;
+
+        if (access.Scale > 1)
+        {
+            expression += "*" + std::to_string(access.Scale);
+        }
+    }
+
+    return expression;
+}
+
+std::string BuildMemoryExpression(const decomp::MemoryAccess& access)
+{
+    if (access.StackFrameRelative)
+    {
+        return "[frame" + decomp::HexS64(access.FrameOffset) + "]";
+    }
+
+    std::string expression = access.BaseRegister.empty() ? "mem" : access.BaseRegister;
+
+    if (!access.Displacement.empty() && access.Displacement != "0")
+    {
+        expression += access.Displacement.front() == '-' ? access.Displacement : ("+" + access.Displacement);
+    }
+
+    if (!access.IndexRegister.empty())
+    {
+        expression += "+" + access.IndexRegister;
+
+        if (access.Scale > 1U)
+        {
+            expression += "*" + std::to_string(access.Scale);
+        }
+    }
+
+    return "[" + expression + "]";
+}
+
+uint64_t AddSignedOffset(uint64_t base, int32_t offset)
+{
+    if (offset < 0)
+    {
+        const uint32_t magnitude = offset == INT32_MIN ? 0x80000000U : static_cast<uint32_t>(-offset);
+        return base - magnitude;
+    }
+
+    return base + static_cast<uint32_t>(offset);
+}
+
+bool TryResolveSwitchEntryTarget(
+    IDebugDataSpaces4* dataSpaces,
+    const decomp::ModuleInfo& moduleInfo,
+    const std::vector<decomp::FunctionRegion>& regions,
+    uint64_t tableAddress,
+    uint64_t contextEndAddress,
+    size_t entryIndex,
+    size_t entrySize,
+    uint64_t& target)
+{
+    const uint64_t entryAddress = tableAddress + static_cast<uint64_t>(entryIndex * entrySize);
+
+    if (entrySize == sizeof(uint64_t))
+    {
+        uint64_t value = 0;
+
+        if (!TryReadPointerValue(dataSpaces, entryAddress, value))
+        {
+            return false;
+        }
+
+        if (IsLikelyCodeAddress(moduleInfo, regions, value))
+        {
+            target = value;
+            return true;
+        }
+
+        if (moduleInfo.Base != 0 && moduleInfo.Size != 0 && value < moduleInfo.Size)
+        {
+            const uint64_t rvaTarget = moduleInfo.Base + value;
+
+            if (IsLikelyCodeAddress(moduleInfo, regions, rvaTarget))
+            {
+                target = rvaTarget;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    uint32_t raw = 0;
+
+    if (!TryReadU32Value(dataSpaces, entryAddress, raw))
+    {
+        return false;
+    }
+
+    const int32_t relative = static_cast<int32_t>(raw);
+    const std::array<uint64_t, 3> candidates = {
+        AddSignedOffset(tableAddress, relative),
+        AddSignedOffset(contextEndAddress, relative),
+        static_cast<uint64_t>(raw)
+    };
+
+    for (const uint64_t candidate : candidates)
+    {
+        if (IsLikelyCodeAddress(moduleInfo, regions, candidate))
+        {
+            target = candidate;
+            return true;
+        }
+    }
+
+    if (moduleInfo.Base != 0 && moduleInfo.Size != 0 && raw < moduleInfo.Size)
+    {
+        const uint64_t rvaTarget = moduleInfo.Base + raw;
+
+        if (IsLikelyCodeAddress(moduleInfo, regions, rvaTarget))
+        {
+            target = rvaTarget;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::string FindBlockContainingAddress(const decomp::AnalysisFacts& facts, uint64_t address)
+{
+    for (const decomp::BasicBlock& block : facts.Blocks)
+    {
+        if (address >= block.StartAddress && address < block.EndAddress)
+        {
+            return block.Id;
+        }
+    }
+
+    return std::string();
+}
+
+void RefreshSwitchControlFlowTargets(decomp::AnalysisFacts& facts)
+{
+    for (const decomp::SwitchInfo& switchInfo : facts.Switches)
+    {
+        const std::string headerBlock = FindBlockContainingAddress(facts, switchInfo.Site);
+
+        if (headerBlock.empty())
+        {
+            continue;
+        }
+
+        for (decomp::BasicBlock& block : facts.Blocks)
+        {
+            if (block.Id != headerBlock)
+            {
+                continue;
+            }
+
+            if (switchInfo.DefaultTarget != 0)
+            {
+                const std::string defaultBlock = FindBlockContainingAddress(facts, switchInfo.DefaultTarget);
+
+                if (!defaultBlock.empty())
+                {
+                    AppendUniqueString(block.Successors, defaultBlock);
+                }
+            }
+
+            for (const uint64_t target : switchInfo.CaseTargets)
+            {
+                const std::string targetBlock = FindBlockContainingAddress(facts, target);
+
+                if (!targetBlock.empty())
+                {
+                    AppendUniqueString(block.Successors, targetBlock);
+                }
+            }
+
+            break;
+        }
+
+        for (decomp::ControlFlowRegion& region : facts.ControlFlow)
+        {
+            if (region.Kind != "switch_candidate" || region.HeaderBlock != headerBlock)
+            {
+                continue;
+            }
+
+            for (const uint64_t target : switchInfo.CaseTargets)
+            {
+                const std::string targetBlock = FindBlockContainingAddress(facts, target);
+
+                if (!targetBlock.empty())
+                {
+                    AppendUniqueString(region.BodyBlocks, targetBlock);
+                }
+            }
+
+            if (switchInfo.DefaultTarget != 0)
+            {
+                const std::string defaultBlock = FindBlockContainingAddress(facts, switchInfo.DefaultTarget);
+
+                if (!defaultBlock.empty())
+                {
+                    AppendUniqueString(region.BodyBlocks, defaultBlock);
+                }
+
+                region.Evidence += "; default=" + decomp::HexU64(switchInfo.DefaultTarget);
+                region.Confidence = decomp::Clamp01(region.Confidence + 0.04);
+            }
+
+            if (!switchInfo.CaseTargets.empty())
+            {
+                region.Evidence += "; recovered_targets=" + std::to_string(switchInfo.CaseTargets.size());
+                region.Confidence = decomp::Clamp01(region.Confidence + 0.12);
+            }
+        }
+    }
+}
+
+void RecoverSwitchTargetsFromDebugData(
+    IDebugDataSpaces4* dataSpaces,
+    const decomp::ModuleInfo& moduleInfo,
+    const std::vector<decomp::FunctionRegion>& regions,
+    const std::vector<DecodedInstructionContext>& decodedContexts,
+    decomp::AnalysisFacts& facts)
+{
+    for (decomp::SwitchInfo& switchInfo : facts.Switches)
+    {
+        const DecodedInstructionContext* context = FindDecodedContextAtSite(decodedContexts, switchInfo.Site);
+        const decomp::MemoryAccess* access = FindMemoryAccessAtSite(facts, switchInfo.Site);
+
+        if (context == nullptr || access == nullptr || !context->HasRipRelativeMemory)
+        {
+            continue;
+        }
+
+        switchInfo.TableAddress = context->RipRelativeTarget;
+        const std::string indexExpression = BuildSwitchIndexExpression(*access);
+
+        if (!indexExpression.empty())
+        {
+            switchInfo.IndexExpression = indexExpression;
+        }
+
+        const size_t entrySize = (access->Scale == sizeof(uint32_t) || access->WidthBits == 32)
+            ? sizeof(uint32_t)
+            : sizeof(uint64_t);
+        const size_t wantedEntries = switchInfo.CaseCount != 0
+            ? (std::min<size_t>)(switchInfo.CaseCount, 64)
+            : 16;
+        size_t invalidRun = 0;
+
+        for (size_t index = 0; index < wantedEntries && invalidRun < 3; ++index)
+        {
+            uint64_t target = 0;
+
+            if (TryResolveSwitchEntryTarget(
+                    dataSpaces,
+                    moduleInfo,
+                    regions,
+                    switchInfo.TableAddress,
+                    context->EndAddress,
+                    index,
+                    entrySize,
+                    target))
+            {
+                AppendUniqueAddress(switchInfo.CaseTargets, target);
+                invalidRun = 0;
+            }
+            else if (!switchInfo.CaseTargets.empty())
+            {
+                ++invalidRun;
+            }
+        }
+
+        if (!switchInfo.CaseTargets.empty())
+        {
+            switchInfo.CaseCount = (std::max<uint32_t>)(switchInfo.CaseCount, static_cast<uint32_t>(switchInfo.CaseTargets.size()));
+            switchInfo.Detail += " ; table=" + decomp::HexU64(switchInfo.TableAddress)
+                + " recovered_targets=" + std::to_string(switchInfo.CaseTargets.size());
+        }
+    }
+
+    decomp::ApplyRecoveredSwitchTargets(facts);
+}
+
 bool TryReadRegisterU64(IDebugRegisters2* registers, const char* name, uint64_t& value)
 {
     if (registers == nullptr || name == nullptr)
@@ -2461,7 +3194,7 @@ void AddObservedMemoryHotspots(const decomp::AnalysisFacts& facts, decomp::Obser
 
     for (const auto& access : facts.MemoryAccesses)
     {
-        if (access.Access.empty())
+        if (access.Implicit || access.Access.empty())
         {
             continue;
         }
@@ -2648,7 +3381,50 @@ std::string ExtractReturnTypeFromPrototype(const std::string& prototype, const s
 
         if (firstParen != std::string::npos)
         {
-            const std::string prefix = decomp::TrimCopy(trimmed.substr(0, firstParen));
+            std::string prefix = decomp::TrimCopy(trimmed.substr(0, firstParen));
+            std::vector<std::string> nameCandidates;
+            nameCandidates.push_back(displayName);
+
+            const size_t bang = displayName.rfind('!');
+            if (bang != std::string::npos && bang + 1 < displayName.size())
+            {
+                nameCandidates.push_back(displayName.substr(bang + 1));
+            }
+
+            const size_t scope = displayName.rfind("::");
+            if (scope != std::string::npos && scope + 2 < displayName.size())
+            {
+                nameCandidates.push_back(displayName.substr(scope + 2));
+            }
+
+            for (const std::string& candidate : nameCandidates)
+            {
+                if (candidate.empty() || prefix.size() < candidate.size())
+                {
+                    continue;
+                }
+
+                const std::string suffix = prefix.substr(prefix.size() - candidate.size());
+
+                if (decomp::ToLowerAscii(suffix) == decomp::ToLowerAscii(candidate))
+                {
+                    prefix = decomp::TrimCopy(prefix.substr(0, prefix.size() - candidate.size()));
+                    break;
+                }
+            }
+
+            while (!prefix.empty() && (prefix.back() == '!' || prefix.back() == ':'))
+            {
+                const size_t lastSpace = prefix.find_last_of(" \t");
+
+                if (lastSpace == std::string::npos)
+                {
+                    prefix.clear();
+                    break;
+                }
+
+                prefix = decomp::TrimCopy(prefix.substr(0, lastSpace));
+            }
 
             if (!prefix.empty())
             {
@@ -2679,6 +3455,232 @@ std::string ExtractReturnTypeFromPrototype(const std::string& prototype, const s
     }
 
     return "UNKNOWN_TYPE";
+}
+
+std::vector<std::string> SplitTopLevelCommaList(const std::string& text)
+{
+    std::vector<std::string> values;
+    std::string current;
+    int parenDepth = 0;
+    int angleDepth = 0;
+    int bracketDepth = 0;
+
+    for (const char ch : text)
+    {
+        if (ch == '(')
+        {
+            ++parenDepth;
+        }
+        else if (ch == ')' && parenDepth > 0)
+        {
+            --parenDepth;
+        }
+        else if (ch == '<')
+        {
+            ++angleDepth;
+        }
+        else if (ch == '>' && angleDepth > 0)
+        {
+            --angleDepth;
+        }
+        else if (ch == '[')
+        {
+            ++bracketDepth;
+        }
+        else if (ch == ']' && bracketDepth > 0)
+        {
+            --bracketDepth;
+        }
+
+        if (ch == ',' && parenDepth == 0 && angleDepth == 0 && bracketDepth == 0)
+        {
+            values.push_back(decomp::TrimCopy(current));
+            current.clear();
+            continue;
+        }
+
+        current.push_back(ch);
+    }
+
+    const std::string tail = decomp::TrimCopy(current);
+
+    if (!tail.empty())
+    {
+        values.push_back(tail);
+    }
+
+    return values;
+}
+
+bool IsPrototypeTypeWord(const std::string& token)
+{
+    static const std::array<const char*, 31> words = {
+        "char", "short", "int", "long", "void", "bool", "float", "double",
+        "signed", "unsigned", "const", "volatile", "struct", "class", "enum",
+        "union", "auto", "register", "__int8", "__int16", "__int32", "__int64",
+        "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
+        "uint32_t", "uint64_t", "size_t"
+    };
+    const std::string lower = decomp::ToLowerAscii(decomp::TrimCopy(token));
+
+    return std::find_if(
+               words.begin(),
+               words.end(),
+               [&lower](const char* value)
+               {
+                   return lower == value;
+               })
+        != words.end();
+}
+
+std::string LastIdentifierToken(const std::string& text, size_t& start)
+{
+    start = std::string::npos;
+    size_t end = text.size();
+
+    while (end > 0 && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0)
+    {
+        --end;
+    }
+
+    size_t cursor = end;
+
+    while (cursor > 0)
+    {
+        const unsigned char ch = static_cast<unsigned char>(text[cursor - 1]);
+
+        if (std::isalnum(ch) == 0 && ch != '_')
+        {
+            break;
+        }
+
+        --cursor;
+    }
+
+    if (cursor == end)
+    {
+        return std::string();
+    }
+
+    start = cursor;
+    return text.substr(cursor, end - cursor);
+}
+
+bool IsFloatingPointPrototypeType(const std::string& type)
+{
+    const std::string lower = decomp::ToLowerAscii(type);
+
+    if (lower.find('*') != std::string::npos || lower.find('&') != std::string::npos)
+    {
+        return false;
+    }
+
+    return lower.find("float") != std::string::npos
+        || lower.find("double") != std::string::npos
+        || lower.find("__m128") != std::string::npos
+        || lower.find("__m256") != std::string::npos
+        || lower.find("__m512") != std::string::npos
+        || lower.find("xmm") != std::string::npos
+        || lower.find("ymm") != std::string::npos
+        || lower.find("zmm") != std::string::npos;
+}
+
+std::string PrototypeParameterLocation(uint32_t ordinal, const std::string& type)
+{
+    static const std::array<const char*, 4> integerRegisterLocations = { "rcx", "rdx", "r8", "r9" };
+    static const std::array<const char*, 4> vectorRegisterLocations = { "xmm0", "xmm1", "xmm2", "xmm3" };
+
+    if (ordinal >= 1U && ordinal <= 4U)
+    {
+        return IsFloatingPointPrototypeType(type)
+            ? vectorRegisterLocations[ordinal - 1U]
+            : integerRegisterLocations[ordinal - 1U];
+    }
+
+    return "stack+" + decomp::HexS64(0x20 + static_cast<int64_t>(ordinal - 5U) * 8);
+}
+
+std::vector<decomp::PrototypeParameter> ParsePrototypeParameters(const std::string& prototype)
+{
+    std::vector<decomp::PrototypeParameter> parameters;
+    const std::string trimmed = decomp::TrimCopy(prototype);
+    const size_t open = trimmed.find('(');
+    const size_t close = trimmed.rfind(')');
+
+    if (open == std::string::npos || close == std::string::npos || close <= open)
+    {
+        return parameters;
+    }
+
+    const std::string body = decomp::TrimCopy(trimmed.substr(open + 1, close - open - 1));
+
+    const std::string lowerBody = decomp::ToLowerAscii(body);
+
+    if (body.empty() || lowerBody == "void" || body == "...")
+    {
+        return parameters;
+    }
+
+    const std::vector<std::string> rawParameters = SplitTopLevelCommaList(body);
+
+    for (const std::string& rawParameter : rawParameters)
+    {
+        std::string parameterText = decomp::TrimCopy(rawParameter);
+        const size_t defaultValue = parameterText.find('=');
+
+        if (defaultValue != std::string::npos)
+        {
+            parameterText = decomp::TrimCopy(parameterText.substr(0, defaultValue));
+        }
+
+        if (parameterText.empty())
+        {
+            continue;
+        }
+
+        decomp::PrototypeParameter parameter;
+        parameter.Ordinal = static_cast<uint32_t>(parameters.size() + 1U);
+        parameter.Confidence = 0.76;
+
+        if (parameterText == "...")
+        {
+            if (parameters.empty())
+            {
+                continue;
+            }
+
+            parameter.Type = "...";
+            parameter.Name = "varargs";
+            parameter.Location = "varargs";
+            parameter.Confidence = 0.58;
+            parameters.push_back(std::move(parameter));
+            continue;
+        }
+
+        size_t nameStart = std::string::npos;
+        const std::string lastToken = LastIdentifierToken(parameterText, nameStart);
+
+        if (!lastToken.empty()
+            && nameStart != std::string::npos
+            && nameStart > 0
+            && !IsPrototypeTypeWord(lastToken))
+        {
+            parameter.Name = lastToken;
+            parameter.Type = decomp::TrimCopy(parameterText.substr(0, nameStart));
+        }
+
+        if (parameter.Type.empty())
+        {
+            parameter.Type = parameterText;
+            parameter.Name = "param" + std::to_string(parameter.Ordinal);
+            parameter.Confidence = 0.66;
+        }
+
+        parameter.Location = PrototypeParameterLocation(parameter.Ordinal, parameter.Type);
+        parameters.push_back(std::move(parameter));
+    }
+
+    return parameters;
 }
 
 std::string InferSideEffectsFromName(const std::string& displayName)
@@ -2775,6 +3777,228 @@ std::string InferMemoryEffectsFromName(const std::string& displayName)
     }
 
     return "unknown";
+}
+
+std::string SimplifyApiNameKey(std::string name)
+{
+    name = decomp::ToLowerAscii(decomp::TrimCopy(name));
+    const size_t bang = name.rfind('!');
+
+    if (bang != std::string::npos && bang + 1 < name.size())
+    {
+        name = name.substr(bang + 1);
+    }
+
+    if (decomp::StartsWithInsensitive(name, "__imp_"))
+    {
+        name = name.substr(6);
+    }
+
+    return name;
+}
+
+decomp::PrototypeParameter MakeKnownApiParameter(
+    uint32_t ordinal,
+    const std::string& name,
+    const std::string& type)
+{
+    decomp::PrototypeParameter parameter;
+    parameter.Ordinal = ordinal;
+    parameter.Name = name;
+    parameter.Type = type;
+    parameter.Location = PrototypeParameterLocation(ordinal, type);
+    parameter.Confidence = 0.74;
+    return parameter;
+}
+
+std::vector<decomp::PrototypeParameter> BuildKnownApiParameters(const std::string& displayName)
+{
+    const std::string key = SimplifyApiNameKey(displayName);
+
+    if (key.find("memcpy") != std::string::npos
+        || key.find("memmove") != std::string::npos
+        || key.find("rtlcopymemory") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "dst", "void *"),
+            MakeKnownApiParameter(2, "src", "const void *"),
+            MakeKnownApiParameter(3, "size", "size_t")
+        };
+    }
+
+    if (key.find("memset") != std::string::npos
+        || key.find("rtlfillmemory") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "dst", "void *"),
+            MakeKnownApiParameter(2, "value", "int"),
+            MakeKnownApiParameter(3, "size", "size_t")
+        };
+    }
+
+    if (key.find("rtlzeromemory") != std::string::npos
+        || key.find("zeromemory") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "dst", "void *"),
+            MakeKnownApiParameter(2, "size", "size_t")
+        };
+    }
+
+    if (key.find("heapalloc") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "heap", "HANDLE"),
+            MakeKnownApiParameter(2, "flags", "DWORD"),
+            MakeKnownApiParameter(3, "size", "SIZE_T")
+        };
+    }
+
+    if (key.find("exallocatepool") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "pool_type", "POOL_TYPE"),
+            MakeKnownApiParameter(2, "size", "SIZE_T")
+        };
+    }
+
+    if (key.find("malloc") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "size", "size_t")
+        };
+    }
+
+    if (key.find("heapfree") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "heap", "HANDLE"),
+            MakeKnownApiParameter(2, "flags", "DWORD"),
+            MakeKnownApiParameter(3, "ptr", "void *")
+        };
+    }
+
+    if (key.find("exfreepool") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "ptr", "void *")
+        };
+    }
+
+    if (key.find("closehandle") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "handle", "HANDLE")
+        };
+    }
+
+    if (key.find("free") != std::string::npos)
+    {
+        return {
+            MakeKnownApiParameter(1, "ptr", "void *")
+        };
+    }
+
+    return {};
+}
+
+void ApplyKnownApiSemantics(decomp::CallTargetInfo& call)
+{
+    const std::string key = SimplifyApiNameKey(call.DisplayName);
+    bool recognized = false;
+
+    if (key.find("memcpy") != std::string::npos
+        || key.find("memmove") != std::string::npos
+        || key.find("rtlcopymemory") != std::string::npos)
+    {
+        call.ReturnType = key.find("rtlcopymemory") != std::string::npos ? "void" : "void *";
+        call.SideEffects = "copies bytes between caller-provided buffers";
+        call.MemoryEffects = "writes dst[0..size) and reads src[0..size)";
+        call.Ownership = "no_transfer";
+        recognized = true;
+    }
+    else if (key.find("memset") != std::string::npos
+        || key.find("rtlfillmemory") != std::string::npos
+        || key.find("rtlzeromemory") != std::string::npos
+        || key.find("zeromemory") != std::string::npos)
+    {
+        call.ReturnType = (key.find("rtl") != std::string::npos || key.find("zeromemory") != std::string::npos) ? "void" : "void *";
+        call.SideEffects = key.find("zero") != std::string::npos ? "zeros caller-provided buffer" : "fills caller-provided buffer";
+        call.MemoryEffects = "writes dst[0..size)";
+        call.Ownership = "no_transfer";
+        recognized = true;
+    }
+    else if (key.find("malloc") != std::string::npos
+        || key.find("heapalloc") != std::string::npos
+        || key.find("exallocatepool") != std::string::npos)
+    {
+        call.ReturnType = "void *";
+        call.SideEffects = "allocates memory";
+        call.MemoryEffects = "returns newly allocated storage on success";
+        call.Ownership = "returns_owned_resource";
+        recognized = true;
+    }
+    else if (key.find("free") != std::string::npos
+        || key.find("heapfree") != std::string::npos
+        || key.find("exfreepool") != std::string::npos
+        || key.find("closehandle") != std::string::npos)
+    {
+        call.ReturnType = key.find("heapfree") != std::string::npos || key.find("closehandle") != std::string::npos ? "BOOL" : "void";
+        call.SideEffects = "releases caller-owned resource";
+        call.MemoryEffects = "invalidates released handle or pointer on success";
+        call.Ownership = "releases_resource";
+        recognized = true;
+    }
+    else if (decomp::StartsWithInsensitive(key, "nt") || decomp::StartsWithInsensitive(key, "zw"))
+    {
+        call.ReturnType = "NTSTATUS";
+        call.SideEffects = "may update out parameters and returns NTSTATUS";
+        call.MemoryEffects = "may read input buffers and write output buffers";
+        call.Ownership = "api_contract";
+        recognized = true;
+    }
+
+    if (recognized)
+    {
+        const std::vector<decomp::PrototypeParameter> parameters = BuildKnownApiParameters(call.DisplayName);
+
+        if (!parameters.empty())
+        {
+            call.Parameters = parameters;
+        }
+
+        call.Confidence = decomp::Clamp01(call.Confidence + 0.12);
+    }
+}
+
+void ApplyKnownApiSemantics(decomp::CalleeSummary& summary)
+{
+    decomp::CallTargetInfo call;
+    call.Site = summary.Site;
+    call.DisplayName = summary.Callee;
+    call.ReturnType = summary.ReturnType;
+    call.SideEffects = summary.SideEffects;
+    call.MemoryEffects = summary.MemoryEffects;
+    call.Ownership = summary.Ownership;
+    call.Parameters = summary.Parameters;
+    call.Confidence = summary.Confidence;
+
+    ApplyKnownApiSemantics(call);
+
+    summary.ReturnType = call.ReturnType;
+    summary.SideEffects = call.SideEffects;
+    summary.MemoryEffects = call.MemoryEffects;
+    summary.Ownership = call.Ownership;
+    summary.Parameters = call.Parameters;
+    summary.Confidence = call.Confidence;
+
+    if (!call.Parameters.empty())
+    {
+        summary.ParameterModel = "known_api_model";
+        summary.Source = summary.Source.empty() || summary.Source == "symbol_type" || summary.Source == "symbol"
+            ? "known_api_model"
+            : summary.Source;
+    }
 }
 
 bool ContainsAddressInRegions(const std::vector<decomp::FunctionRegion>& regions, const uint64_t address)
@@ -3718,6 +4942,7 @@ void CollectPdbFacts(
     if (TryGetTypeNameForOffset(symbols, facts.EntryAddress, facts.Pdb.Prototype))
     {
         facts.Pdb.ReturnType = ExtractReturnTypeFromPrototype(facts.Pdb.Prototype, facts.Pdb.FunctionName);
+        facts.Pdb.PrototypeParameters = ParsePrototypeParameters(facts.Pdb.Prototype);
     }
 
     std::vector<ScopedPdbSymbolRecord> pdbParams;
@@ -3754,6 +4979,7 @@ void CollectPdbFacts(
     }
 
     ApplyPdbParamsToRecoveredArguments(pdbParams, facts);
+    decomp::RefreshDerivedAnalysisFacts(facts);
     CollectPdbSourceLocations(symbols, facts, facts.Pdb);
 
     std::unordered_map<std::string, EnumeratedFieldInfo> fieldByRegisterAndOffset;
@@ -3866,6 +5092,27 @@ void CollectPdbFacts(
     }
 }
 
+bool IsTailCallContext(const DecodedInstructionContext& context, const decomp::AnalysisFacts& facts)
+{
+    if (!context.IsUnconditionalBranch
+        || context.IsIndirect
+        || !context.HasBranchTarget
+        || context.BranchTarget == context.EndAddress)
+    {
+        return false;
+    }
+
+    for (const decomp::DisassembledInstruction& instruction : facts.Instructions)
+    {
+        if (instruction.Address == context.BranchTarget)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void EnrichAnalysisFactsWithDebugMetadata(
     IDebugSymbols3* symbols,
     IDebugDataSpaces4* dataSpaces,
@@ -3938,7 +5185,9 @@ void EnrichAnalysisFactsWithDebugMetadata(
             facts.DataReferences.push_back(std::move(reference));
         }
 
-        if (!context.IsCall)
+        const bool isTailCall = IsTailCallContext(context, facts);
+
+        if (!context.IsCall && !isTailCall)
         {
             continue;
         }
@@ -3946,6 +5195,8 @@ void EnrichAnalysisFactsWithDebugMetadata(
         decomp::CallTargetInfo call;
         call.Site = context.Address;
         call.Indirect = context.IsIndirect;
+        call.TailCall = isTailCall;
+        const decomp::MemoryAccess* callAccess = FindMemoryAccessAtSite(facts, context.Address);
 
         uint64_t targetAddress = 0;
 
@@ -3959,6 +5210,38 @@ void EnrichAnalysisFactsWithDebugMetadata(
         }
 
         call.TargetAddress = targetAddress;
+
+        if (context.IsIndirect && callAccess != nullptr)
+        {
+            int64_t displacement = 0;
+            const bool hasParsedDisplacement = callAccess->Displacement.empty()
+                || TryParseSignedValue(callAccess->Displacement, displacement);
+
+            call.TargetExpression = BuildMemoryExpression(*callAccess);
+
+            if (call.TargetKind.empty())
+            {
+                call.TargetKind = "indirect_memory";
+            }
+
+            if (callAccess->WidthBits == 64
+                && !callAccess->StackFrameRelative
+                && !callAccess->BaseRegister.empty()
+                && callAccess->BaseRegister != "rip"
+                && callAccess->BaseRegister != "rsp"
+                && callAccess->BaseRegister != "rbp"
+                && hasParsedDisplacement
+                && displacement >= 0)
+            {
+                call.VirtualCall = true;
+                call.VtableOffset = static_cast<uint32_t>(displacement);
+                call.TargetKind = "virtual_call_candidate";
+            }
+        }
+        else if (context.IsIndirect && !context.Operands.empty())
+        {
+            call.TargetExpression = decomp::JoinStrings(context.Operands, ", ");
+        }
 
         SymbolLookupResult symbol;
         decomp::ModuleInfo calleeModule;
@@ -3984,14 +5267,16 @@ void EnrichAnalysisFactsWithDebugMetadata(
         {
             if (targetAddress != 0 && !calleeModule.ModuleName.empty())
             {
-                call.TargetKind =
-                    (calleeModule.ModuleName == moduleInfo.ModuleName)
-                    ? (context.IsIndirect ? "internal_indirect" : "internal_direct")
-                    : (context.IsIndirect ? "external_indirect" : "external_direct");
+                const std::string scope = (calleeModule.ModuleName == moduleInfo.ModuleName) ? "internal" : "external";
+                call.TargetKind = isTailCall
+                    ? ("tail_call_" + scope + (context.IsIndirect ? "_indirect" : "_direct"))
+                    : (scope + (context.IsIndirect ? "_indirect" : "_direct"));
             }
             else
             {
-                call.TargetKind = context.IsIndirect ? "indirect" : "direct";
+                call.TargetKind = isTailCall
+                    ? (context.IsIndirect ? "tail_call_indirect" : "tail_call_direct")
+                    : (context.IsIndirect ? "indirect" : "direct");
             }
         }
 
@@ -3999,13 +5284,22 @@ void EnrichAnalysisFactsWithDebugMetadata(
         call.ModuleName = !calleeModule.ModuleName.empty() ? calleeModule.ModuleName : moduleInfo.ModuleName;
         call.Prototype = !typeName.empty() ? typeName : ("UNKNOWN_TYPE " + displayName + "(...)");
         call.ReturnType = ExtractReturnTypeFromPrototype(typeName, displayName);
-        call.SideEffects = InferSideEffectsFromName(displayName);
+        call.Parameters = ParsePrototypeParameters(call.Prototype);
+        call.SideEffects = isTailCall ? "tail-calls target and does not return to this function" : InferSideEffectsFromName(displayName);
+        call.MemoryEffects = InferMemoryEffectsFromName(displayName);
+        call.Ownership =
+            (decomp::ContainsInsensitive(displayName, "Alloc") || decomp::ContainsInsensitive(displayName, "malloc") || decomp::ContainsInsensitive(displayName, "operator new")) ? "may_return_owned_resource"
+            : (decomp::ContainsInsensitive(displayName, "Free") || decomp::ContainsInsensitive(displayName, "delete") || decomp::ContainsInsensitive(displayName, "Close")) ? "may_release_resource"
+            : "unknown";
         call.Confidence = decomp::Clamp01(
             0.50
             + (targetAddress != 0 ? 0.10 : 0.0)
             + (!symbol.Name.empty() ? 0.15 : 0.0)
             + (!typeName.empty() ? 0.15 : 0.0)
-            + (context.HasRipRelativeMemory ? 0.05 : 0.0));
+            + (context.HasRipRelativeMemory ? 0.05 : 0.0)
+            + (isTailCall ? 0.05 : 0.0)
+            + (call.VirtualCall ? 0.06 : 0.0));
+        ApplyKnownApiSemantics(call);
         facts.CallTargets.push_back(std::move(call));
     }
 
@@ -4035,17 +5329,22 @@ void EnrichAnalysisFactsWithDebugMetadata(
         summary.ReturnType = !target.ReturnType.empty() ? target.ReturnType : "UNKNOWN_TYPE";
         summary.ParameterModel = !target.Prototype.empty() ? target.Prototype : "UNKNOWN_TYPE " + target.DisplayName + "(...)";
         summary.SideEffects = target.SideEffects.empty() ? "unknown" : target.SideEffects;
-        summary.MemoryEffects = InferMemoryEffectsFromName(target.DisplayName);
+        summary.MemoryEffects = !target.MemoryEffects.empty()
+            ? target.MemoryEffects
+            : target.TailCall ? "delegates to tail-call target" : InferMemoryEffectsFromName(target.DisplayName);
         if (summary.MemoryEffects == "unknown")
         {
             summary.MemoryEffects = target.SideEffects;
         }
-        summary.Ownership =
-            (decomp::ContainsInsensitive(target.DisplayName, "Alloc") || decomp::ContainsInsensitive(target.DisplayName, "malloc") || decomp::ContainsInsensitive(target.DisplayName, "operator new")) ? "may_return_owned_resource"
+        summary.Ownership = !target.Ownership.empty() ? target.Ownership
+            : (decomp::ContainsInsensitive(target.DisplayName, "Alloc") || decomp::ContainsInsensitive(target.DisplayName, "malloc") || decomp::ContainsInsensitive(target.DisplayName, "operator new")) ? "may_return_owned_resource"
             : (decomp::ContainsInsensitive(target.DisplayName, "Free") || decomp::ContainsInsensitive(target.DisplayName, "delete") || decomp::ContainsInsensitive(target.DisplayName, "Close")) ? "may_release_resource"
             : "unknown";
-        summary.Source = target.Prototype.empty() ? "symbol" : "symbol_type";
-        summary.Confidence = decomp::Clamp01(target.Confidence + (!target.Prototype.empty() ? 0.08 : 0.0));
+        summary.Source = target.TailCall ? "tail_call_target" : (target.Prototype.empty() ? "symbol" : "symbol_type");
+        summary.Parameters = target.Parameters;
+        summary.TailCall = target.TailCall;
+        summary.Confidence = decomp::Clamp01(target.Confidence + (!target.Prototype.empty() ? 0.08 : 0.0) + (target.TailCall ? 0.03 : 0.0));
+        ApplyKnownApiSemantics(summary);
 
         if (existing != facts.CalleeSummaries.end())
         {
@@ -4115,6 +5414,20 @@ void EnrichAnalysisFactsWithDebugMetadata(
         idiom.Evidence = target.DisplayName;
         idiom.Confidence = target.Confidence > 0.0 ? decomp::Clamp01(target.Confidence + 0.08) : 0.78;
         facts.Idioms.push_back(std::move(idiom));
+    }
+
+    RecoverSwitchTargetsFromDebugData(dataSpaces, moduleInfo, facts.Regions, decodedContexts, facts);
+
+    size_t recoveredSwitchTargets = 0;
+
+    for (const decomp::SwitchInfo& switchInfo : facts.Switches)
+    {
+        recoveredSwitchTargets += switchInfo.CaseTargets.size();
+    }
+
+    if (recoveredSwitchTargets != 0)
+    {
+        facts.Facts.push_back("switch case targets recovered: " + std::to_string(recoveredSwitchTargets));
     }
 }
 
@@ -5139,6 +6452,7 @@ extern "C" HRESULT CALLBACK DecompCommand(PDEBUG_CLIENT client, PCSTR args)
     uint64_t entryAddress = 0;
     decomp::ModuleInfo moduleInfo;
     std::vector<decomp::FunctionRegion> regions;
+    std::vector<FunctionRegionBytes> regionBytes;
     std::vector<uint8_t> bytes;
     std::vector<decomp::DisassembledInstruction> instructions;
     std::vector<DecodedInstructionContext> decodedContexts;
@@ -5284,7 +6598,8 @@ extern "C" HRESULT CALLBACK DecompCommand(PDEBUG_CLIENT client, PCSTR args)
         }
 
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "reading function bytes");
-        bytes = ReadFunctionBytes(api.DataSpaces.Get(), regions);
+        regionBytes = ReadFunctionRegionBytes(api.DataSpaces.Get(), regions);
+        bytes = FlattenFunctionRegionBytes(regionBytes);
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "read bytes=%llu", static_cast<unsigned long long>(bytes.size()));
         if (AbortIfUserInterrupted(api.Control.Get(), api.Control4.Get(), options, "function byte read"))
         {
@@ -5292,7 +6607,7 @@ extern "C" HRESULT CALLBACK DecompCommand(PDEBUG_CLIENT client, PCSTR args)
         }
 
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "disassembling regions");
-        instructions = DisassembleRegions(api.DataSpaces.Get(), api.Control.Get(), regions, options.MaxInstructions, decodedContexts);
+        instructions = DisassembleRegions(api.Control.Get(), regionBytes, options.MaxInstructions, decodedContexts);
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "decoded instructions=%llu", static_cast<unsigned long long>(instructions.size()));
         if (AbortIfUserInterrupted(api.Control.Get(), api.Control4.Get(), options, "disassembly"))
         {
@@ -5302,17 +6617,31 @@ extern "C" HRESULT CALLBACK DecompCommand(PDEBUG_CLIENT client, PCSTR args)
         request.RequestId = decomp::MakeRequestId();
         request.TimeoutMs = options.TimeoutMs;
         request.BriefOutput = options.BriefOutput;
+        const decomp::DebugSessionKind sessionKind = GetSessionKind(api.Control.Get());
+        decomp::SessionPolicyFacts sessionPolicy;
+        bool sessionPolicyCollected = false;
+
+        auto rebuildAnalyzerFacts = [&]()
+        {
+            request.Facts = decomp::BuildAnalysisFacts(
+                target,
+                moduleInfo,
+                sessionKind,
+                options,
+                queryAddress,
+                entryAddress,
+                regions,
+                bytes,
+                instructions);
+
+            if (sessionPolicyCollected)
+            {
+                request.Facts.SessionPolicy = sessionPolicy;
+            }
+        };
+
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "building analyzer facts request_id=%s", request.RequestId.c_str());
-        request.Facts = decomp::BuildAnalysisFacts(
-            target,
-            moduleInfo,
-            GetSessionKind(api.Control.Get()),
-            options,
-            queryAddress,
-            entryAddress,
-            regions,
-            bytes,
-            instructions);
+        rebuildAnalyzerFacts();
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "facts core blocks=%llu calls=%llu conditions=%llu", static_cast<unsigned long long>(request.Facts.Blocks.size()), static_cast<unsigned long long>(request.Facts.Calls.size()), static_cast<unsigned long long>(request.Facts.NormalizedConditions.size()));
         if (AbortIfUserInterrupted(api.Control.Get(), api.Control4.Get(), options, "analyzer facts"))
         {
@@ -5320,9 +6649,50 @@ extern "C" HRESULT CALLBACK DecompCommand(PDEBUG_CLIENT client, PCSTR args)
         }
 
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "collecting session policy");
-        request.Facts.SessionPolicy = BuildSessionPolicyFacts(api.Control.Get());
+        sessionPolicy = BuildSessionPolicyFacts(api.Control.Get());
+        sessionPolicyCollected = true;
+        request.Facts.SessionPolicy = sessionPolicy;
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "enriching debug metadata");
-        EnrichAnalysisFactsWithDebugMetadata(api.Symbols.Get(), api.DataSpaces.Get(), moduleInfo, decodedContexts, request.Facts);
+        bool factsHaveDebugMetadata = false;
+
+        for (size_t switchExpansionPass = 0; switchExpansionPass < 3; ++switchExpansionPass)
+        {
+            EnrichAnalysisFactsWithDebugMetadata(api.Symbols.Get(), api.DataSpaces.Get(), moduleInfo, decodedContexts, request.Facts);
+            factsHaveDebugMetadata = true;
+
+            size_t addedSwitchRegions = 0;
+
+            if (!TryAddSwitchTargetRegions(
+                    api.Control.Get(),
+                    moduleInfo,
+                    request.Facts,
+                    options.MaxInstructions,
+                    regions,
+                    addedSwitchRegions))
+            {
+                break;
+            }
+
+            factsHaveDebugMetadata = false;
+            OutputVerbose(
+                api.Control.Get(),
+                api.Control4.Get(),
+                options,
+                "switch target expansion pass=%llu added_regions=%llu",
+                static_cast<unsigned long long>(switchExpansionPass + 1U),
+                static_cast<unsigned long long>(addedSwitchRegions));
+
+            regionBytes = ReadFunctionRegionBytes(api.DataSpaces.Get(), regions);
+            bytes = FlattenFunctionRegionBytes(regionBytes);
+            decodedContexts.clear();
+            instructions = DisassembleRegions(api.Control.Get(), regionBytes, options.MaxInstructions, decodedContexts);
+            rebuildAnalyzerFacts();
+        }
+
+        if (!factsHaveDebugMetadata)
+        {
+            EnrichAnalysisFactsWithDebugMetadata(api.Symbols.Get(), api.DataSpaces.Get(), moduleInfo, decodedContexts, request.Facts);
+        }
         if (AbortIfUserInterrupted(api.Control.Get(), api.Control4.Get(), options, "debug metadata enrichment"))
         {
             return E_ABORT;

@@ -249,3 +249,28 @@ set_target_properties(
 )
 
 set_common_warnings(decomp_extension)
+
+enable_testing()
+
+add_executable(
+    decomp_snapshot_tests
+    tests/snapshot_tests.cpp
+    src/extension/llm_client.cpp
+)
+
+target_include_directories(
+    decomp_snapshot_tests
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(
+    decomp_snapshot_tests
+    PRIVATE
+    decomp_shared
+    winhttp
+)
+
+set_common_warnings(decomp_snapshot_tests)
+
+add_test(NAME decomp_snapshot_tests COMMAND decomp_snapshot_tests)

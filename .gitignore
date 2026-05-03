@@ -1,0 +1,12 @@
+# Local build output
+build/
+build-*/
+out/
+
+# Visual Studio local state
+.vs/
+*.suo
+*.user
+
+# Local planning scratchpads
+ROADMAP.md

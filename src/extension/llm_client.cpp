@@ -14,6 +14,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -946,6 +947,22 @@ std::vector<TypedNameConfidence> BuildAnalyzerSkeletonParams(const AnalyzeReques
             params.push_back(std::move(item));
         }
     }
+    else if (!request.Facts.Pdb.PrototypeParameters.empty())
+    {
+        for (const PrototypeParameter& param : request.Facts.Pdb.PrototypeParameters)
+        {
+            if (param.Type == "..." || param.Name == "varargs")
+            {
+                continue;
+            }
+
+            TypedNameConfidence item;
+            item.Name = SanitizeIdentifier(param.Name);
+            item.Type = param.Type.empty() ? "UNKNOWN_TYPE" : param.Type;
+            item.Confidence = param.Confidence;
+            params.push_back(std::move(item));
+        }
+    }
     else if (!request.Facts.RecoveredArguments.empty())
     {
         for (const RecoveredArgument& argument : request.Facts.RecoveredArguments)
@@ -1064,6 +1081,8 @@ constexpr size_t kPromptMemoryAccessLimit = 32;
 constexpr size_t kPromptInstructionWindowLimit = 20;
 constexpr size_t kPromptRecoveredArgumentLimit = 8;
 constexpr size_t kPromptRecoveredLocalLimit = 24;
+constexpr size_t kPromptStackPointerLimit = 32;
+constexpr size_t kPromptCallArgumentLimit = 32;
 constexpr size_t kPromptValueMergeLimit = 16;
 constexpr size_t kPromptIrValueLimit = 32;
 constexpr size_t kPromptControlFlowLimit = 24;
@@ -1103,29 +1122,45 @@ std::string BuildInstructionPreview(const DisassembledInstruction& instruction)
     return HexU64(instruction.Address) + ": " + BuildInstructionSummary(instruction);
 }
 
+using InstructionIndex = std::unordered_map<uint64_t, const DisassembledInstruction*>;
+
+InstructionIndex BuildInstructionIndex(const AnalyzeRequest& request)
+{
+    InstructionIndex index;
+    index.reserve(request.Facts.Instructions.size());
+
+    for (const DisassembledInstruction& instruction : request.Facts.Instructions)
+    {
+        index[instruction.Address] = &instruction;
+    }
+
+    return index;
+}
+
+const DisassembledInstruction* FindInstructionByAddress(
+    const InstructionIndex& index,
+    uint64_t address)
+{
+    const auto found = index.find(address);
+    return found == index.end() ? nullptr : found->second;
+}
+
 const DisassembledInstruction* FindInstructionByAddress(
     const AnalyzeRequest& request,
     uint64_t address)
 {
-    for (const DisassembledInstruction& instruction : request.Facts.Instructions)
-    {
-        if (instruction.Address == address)
-        {
-            return &instruction;
-        }
-    }
-
-    return nullptr;
+    const InstructionIndex index = BuildInstructionIndex(request);
+    return FindInstructionByAddress(index, address);
 }
 
 bool BlockContainsCallKind(
-    const AnalyzeRequest& request,
+    const InstructionIndex& instructionIndex,
     const BasicBlock& block,
     bool indirectOnly)
 {
     for (uint64_t address : block.InstructionAddresses)
     {
-        const DisassembledInstruction* instruction = FindInstructionByAddress(request, address);
+        const DisassembledInstruction* instruction = FindInstructionByAddress(instructionIndex, address);
 
         if (instruction == nullptr)
         {
@@ -1142,12 +1177,12 @@ bool BlockContainsCallKind(
 }
 
 bool BlockContainsReturn(
-    const AnalyzeRequest& request,
+    const InstructionIndex& instructionIndex,
     const BasicBlock& block)
 {
     for (uint64_t address : block.InstructionAddresses)
     {
-        const DisassembledInstruction* instruction = FindInstructionByAddress(request, address);
+        const DisassembledInstruction* instruction = FindInstructionByAddress(instructionIndex, address);
 
         if (instruction != nullptr && instruction->IsReturn)
         {
@@ -1159,12 +1194,12 @@ bool BlockContainsReturn(
 }
 
 bool BlockContainsConditionalBranch(
-    const AnalyzeRequest& request,
+    const InstructionIndex& instructionIndex,
     const BasicBlock& block)
 {
     for (uint64_t address : block.InstructionAddresses)
     {
-        const DisassembledInstruction* instruction = FindInstructionByAddress(request, address);
+        const DisassembledInstruction* instruction = FindInstructionByAddress(instructionIndex, address);
 
         if (instruction != nullptr && instruction->IsConditionalBranch)
         {
@@ -1176,14 +1211,14 @@ bool BlockContainsConditionalBranch(
 }
 
 size_t CountBlockMemoryAccesses(
-    const AnalyzeRequest& request,
+    const InstructionIndex& instructionIndex,
     const BasicBlock& block)
 {
     size_t count = 0;
 
     for (uint64_t address : block.InstructionAddresses)
     {
-        const DisassembledInstruction* instruction = FindInstructionByAddress(request, address);
+        const DisassembledInstruction* instruction = FindInstructionByAddress(instructionIndex, address);
 
         if (instruction != nullptr && instruction->OperandText.find('[') != std::string::npos)
         {
@@ -1215,6 +1250,12 @@ std::vector<size_t> SelectSpreadIndices(size_t totalCount, size_t limit)
 
     std::set<size_t> selected;
 
+    if (limit == 1)
+    {
+        indices.push_back(0);
+        return indices;
+    }
+
     for (size_t slot = 0; slot < limit; ++slot)
     {
         const size_t index = (slot * (totalCount - 1)) / (limit - 1);
@@ -1237,6 +1278,151 @@ std::vector<size_t> SelectSpreadIndices(size_t totalCount, size_t limit)
     return indices;
 }
 
+template<typename ScoreFn>
+std::vector<size_t> SelectRankedSpreadIndices(size_t totalCount, size_t limit, ScoreFn scoreFn)
+{
+    struct ScoredIndex
+    {
+        size_t Index = 0;
+        double Score = 0.0;
+    };
+
+    if (totalCount == 0 || limit == 0)
+    {
+        return {};
+    }
+
+    if (totalCount <= limit)
+    {
+        return SelectSpreadIndices(totalCount, limit);
+    }
+
+    std::vector<size_t> indices;
+    std::set<size_t> selected;
+    std::vector<ScoredIndex> scored;
+    scored.reserve(totalCount);
+
+    for (size_t index = 0; index < totalCount; ++index)
+    {
+        scored.push_back({ index, scoreFn(index) });
+    }
+
+    std::sort(
+        scored.begin(),
+        scored.end(),
+        [](const ScoredIndex& left, const ScoredIndex& right)
+        {
+            if (left.Score != right.Score)
+            {
+                return left.Score > right.Score;
+            }
+
+            return left.Index < right.Index;
+        });
+
+    const size_t rankedBudget = (std::max<size_t>)(1U, limit / 2U);
+
+    for (const ScoredIndex& candidate : scored)
+    {
+        if (indices.size() >= rankedBudget)
+        {
+            break;
+        }
+
+        if (selected.insert(candidate.Index).second)
+        {
+            indices.push_back(candidate.Index);
+        }
+    }
+
+    const std::vector<size_t> spread = SelectSpreadIndices(totalCount, limit);
+
+    for (size_t index : spread)
+    {
+        if (indices.size() >= limit)
+        {
+            break;
+        }
+
+        if (selected.insert(index).second)
+        {
+            indices.push_back(index);
+        }
+    }
+
+    for (const ScoredIndex& candidate : scored)
+    {
+        if (indices.size() >= limit)
+        {
+            break;
+        }
+
+        if (selected.insert(candidate.Index).second)
+        {
+            indices.push_back(candidate.Index);
+        }
+    }
+
+    std::sort(indices.begin(), indices.end());
+    return indices;
+}
+
+double ScorePromptCallTarget(const CallTargetInfo& call)
+{
+    double score = call.Confidence;
+    score += call.TailCall ? 1.0 : 0.0;
+    score += call.VirtualCall ? 0.9 : 0.0;
+    score += call.Indirect ? 0.35 : 0.0;
+    score += !call.Parameters.empty() ? 0.45 : 0.0;
+    score += !call.TargetExpression.empty() ? 0.35 : 0.0;
+    score += !call.MemoryEffects.empty() && call.MemoryEffects != "unknown" ? 0.30 : 0.0;
+    score += !call.Prototype.empty() && call.Prototype.find("UNKNOWN_TYPE") == std::string::npos ? 0.25 : 0.0;
+    return score;
+}
+
+double ScorePromptCalleeSummary(const CalleeSummary& summary)
+{
+    double score = summary.Confidence;
+    score += summary.TailCall ? 0.8 : 0.0;
+    score += !summary.Parameters.empty() ? 0.5 : 0.0;
+    score += summary.Source == "known_api_model" ? 0.6 : 0.0;
+    score += !summary.MemoryEffects.empty() && summary.MemoryEffects != "unknown" ? 0.3 : 0.0;
+    score += !summary.Ownership.empty() && summary.Ownership != "unknown" ? 0.2 : 0.0;
+    return score;
+}
+
+double ScorePromptIrValue(const IrValue& value)
+{
+    double score = value.Confidence;
+    score += value.Kind == "conditional_select" ? 0.8 : 0.0;
+    score += value.Kind == "call_result" ? 0.6 : 0.0;
+    score += !value.Uses.empty() ? 0.3 : 0.0;
+    score += value.IsDead ? -0.35 : 0.0;
+    score += value.IsConstant ? -0.05 : 0.0;
+    return score;
+}
+
+double ScorePromptTypeHint(const TypeRecoveryHint& hint)
+{
+    double score = hint.Confidence;
+    score += hint.Source == "pdb" || hint.Source == "pdb_field" ? 0.8 : 0.0;
+    score += hint.Kind.find("vtable") != std::string::npos ? 0.7 : 0.0;
+    score += hint.PointerLike ? 0.3 : 0.0;
+    score += hint.ArrayLike ? 0.3 : 0.0;
+    score += hint.EnumLike || hint.BitflagLike ? 0.25 : 0.0;
+    return score;
+}
+
+double ScorePromptSwitch(const SwitchInfo& info)
+{
+    double score = 0.0;
+    score += info.CaseCount != 0 ? 0.4 : 0.0;
+    score += !info.CaseTargets.empty() ? 0.7 : 0.0;
+    score += info.RangeKnown ? 0.35 : 0.0;
+    score += info.DefaultTarget != 0 ? 0.35 : 0.0;
+    return score;
+}
+
 std::vector<size_t> SelectRepresentativeBlockIndices(const AnalyzeRequest& request)
 {
     struct BlockScore
@@ -1254,6 +1440,7 @@ std::vector<size_t> SelectRepresentativeBlockIndices(const AnalyzeRequest& reque
     }
 
     const size_t limit = totalBlocks < kPromptBlockLimit ? totalBlocks : kPromptBlockLimit;
+    const InstructionIndex instructionIndex = BuildInstructionIndex(request);
     std::set<size_t> selected;
     indices.push_back(0);
     selected.insert(0);
@@ -1271,12 +1458,12 @@ std::vector<size_t> SelectRepresentativeBlockIndices(const AnalyzeRequest& reque
             score += 1000;
         }
 
-        if (BlockContainsCallKind(request, block, false))
+        if (BlockContainsCallKind(instructionIndex, block, false))
         {
             score += 280;
         }
 
-        if (BlockContainsCallKind(request, block, true))
+        if (BlockContainsCallKind(instructionIndex, block, true))
         {
             score += 320;
         }
@@ -1286,17 +1473,17 @@ std::vector<size_t> SelectRepresentativeBlockIndices(const AnalyzeRequest& reque
             score += 180;
         }
 
-        if (BlockContainsConditionalBranch(request, block))
+        if (BlockContainsConditionalBranch(instructionIndex, block))
         {
             score += 140;
         }
 
-        if (BlockContainsReturn(request, block))
+        if (BlockContainsReturn(instructionIndex, block))
         {
             score += 160;
         }
 
-        const size_t memoryAccessCount = CountBlockMemoryAccesses(request, block);
+        const size_t memoryAccessCount = CountBlockMemoryAccesses(instructionIndex, block);
         score += (memoryAccessCount > 8 ? 8 : memoryAccessCount) * 12;
         score += (block.InstructionAddresses.size() > 12 ? 12 : block.InstructionAddresses.size()) * 4;
 
@@ -1510,6 +1697,7 @@ std::optional<size_t> FindMiddleInterestingInstructionIndex(const AnalyzeRequest
 JsonValue BuildBlocksJson(const AnalyzeRequest& request, bool* truncated)
 {
     JsonValue blocks = JsonValue::MakeArray();
+    const InstructionIndex instructionByAddress = BuildInstructionIndex(request);
     const std::vector<size_t> selectedIndices = SelectRepresentativeBlockIndices(request);
 
     if (truncated != nullptr)
@@ -1526,9 +1714,9 @@ JsonValue BuildBlocksJson(const AnalyzeRequest& request, bool* truncated)
         const size_t headCount = block.InstructionAddresses.size() < kPromptBlockInstructionLimit ? block.InstructionAddresses.size() : kPromptBlockInstructionLimit;
         const size_t tailCount = block.InstructionAddresses.size() < 4 ? block.InstructionAddresses.size() : 4;
 
-        for (size_t instructionIndex = 0; instructionIndex < headCount; ++instructionIndex)
+        for (size_t instructionOffset = 0; instructionOffset < headCount; ++instructionOffset)
         {
-            const DisassembledInstruction* instruction = FindInstructionByAddress(request, block.InstructionAddresses[instructionIndex]);
+            const DisassembledInstruction* instruction = FindInstructionByAddress(instructionByAddress, block.InstructionAddresses[instructionOffset]);
 
             if (instruction != nullptr)
             {
@@ -1538,9 +1726,9 @@ JsonValue BuildBlocksJson(const AnalyzeRequest& request, bool* truncated)
 
         if (block.InstructionAddresses.size() > tailCount)
         {
-            for (size_t instructionIndex = block.InstructionAddresses.size() - tailCount; instructionIndex < block.InstructionAddresses.size(); ++instructionIndex)
+            for (size_t instructionOffset = block.InstructionAddresses.size() - tailCount; instructionOffset < block.InstructionAddresses.size(); ++instructionOffset)
             {
-                const DisassembledInstruction* instruction = FindInstructionByAddress(request, block.InstructionAddresses[instructionIndex]);
+                const DisassembledInstruction* instruction = FindInstructionByAddress(instructionByAddress, block.InstructionAddresses[instructionOffset]);
 
                 if (instruction != nullptr)
                 {
@@ -1555,11 +1743,11 @@ JsonValue BuildBlocksJson(const AnalyzeRequest& request, bool* truncated)
         item.Set("succ", BuildStringArray(block.Successors, 8, nullptr));
         item.Set("terminal", JsonValue::MakeBoolean(block.HasTerminal));
         item.Set("instruction_count", JsonValue::MakeNumber(static_cast<double>(block.InstructionAddresses.size())));
-        item.Set("memory_access_count", JsonValue::MakeNumber(static_cast<double>(CountBlockMemoryAccesses(request, block))));
-        item.Set("has_direct_call", JsonValue::MakeBoolean(BlockContainsCallKind(request, block, false)));
-        item.Set("has_indirect_call", JsonValue::MakeBoolean(BlockContainsCallKind(request, block, true)));
-        item.Set("has_return", JsonValue::MakeBoolean(BlockContainsReturn(request, block)));
-        item.Set("has_conditional_branch", JsonValue::MakeBoolean(BlockContainsConditionalBranch(request, block)));
+        item.Set("memory_access_count", JsonValue::MakeNumber(static_cast<double>(CountBlockMemoryAccesses(instructionByAddress, block))));
+        item.Set("has_direct_call", JsonValue::MakeBoolean(BlockContainsCallKind(instructionByAddress, block, false)));
+        item.Set("has_indirect_call", JsonValue::MakeBoolean(BlockContainsCallKind(instructionByAddress, block, true)));
+        item.Set("has_return", JsonValue::MakeBoolean(BlockContainsReturn(instructionByAddress, block)));
+        item.Set("has_conditional_branch", JsonValue::MakeBoolean(BlockContainsConditionalBranch(instructionByAddress, block)));
         item.Set("insn_head_sample", instructionHeadSample);
         item.Set("insn_tail_sample", instructionTailSample);
         blocks.PushBack(item);
@@ -1598,7 +1786,13 @@ JsonValue BuildCallsJson(
 JsonValue BuildSwitchesJson(const AnalyzeRequest& request, bool* truncated)
 {
     JsonValue array = JsonValue::MakeArray();
-    const std::vector<size_t> indices = SelectSpreadIndices(request.Facts.Switches.size(), kPromptSwitchLimit);
+    const std::vector<size_t> indices = SelectRankedSpreadIndices(
+        request.Facts.Switches.size(),
+        kPromptSwitchLimit,
+        [&request](size_t index)
+        {
+            return ScorePromptSwitch(request.Facts.Switches[index]);
+        });
 
     if (truncated != nullptr)
     {
@@ -1609,9 +1803,25 @@ JsonValue BuildSwitchesJson(const AnalyzeRequest& request, bool* truncated)
     {
         const SwitchInfo& info = request.Facts.Switches[index];
         JsonValue item = JsonValue::MakeObject();
+        JsonValue targets = JsonValue::MakeArray();
+
+        for (size_t targetIndex = 0; targetIndex < info.CaseTargets.size() && targetIndex < 32; ++targetIndex)
+        {
+            targets.PushBack(JsonValue::MakeString(HexU64(info.CaseTargets[targetIndex])));
+        }
+
         item.Set("site", JsonValue::MakeString(HexU64(info.Site)));
+        item.Set("table_address", JsonValue::MakeString(HexU64(info.TableAddress)));
         item.Set("case_count", JsonValue::MakeNumber(static_cast<double>(info.CaseCount)));
+        item.Set("default_target", JsonValue::MakeString(HexU64(info.DefaultTarget)));
+        item.Set("range_min", JsonValue::MakeString(HexS64(info.RangeMin)));
+        item.Set("range_max", JsonValue::MakeString(HexS64(info.RangeMax)));
+        item.Set("range_known", JsonValue::MakeBoolean(info.RangeKnown));
+        item.Set("signed_index", JsonValue::MakeBoolean(info.SignedIndex));
         item.Set("detail", JsonValue::MakeString(info.Detail));
+        item.Set("index_expression", JsonValue::MakeString(info.IndexExpression));
+        item.Set("case_targets", targets);
+        item.Set("case_targets_truncated", JsonValue::MakeBoolean(info.CaseTargets.size() > 32));
         array.PushBack(item);
     }
 
@@ -1621,6 +1831,7 @@ JsonValue BuildSwitchesJson(const AnalyzeRequest& request, bool* truncated)
 JsonValue BuildMemoryAccessesJson(const AnalyzeRequest& request, bool* truncated)
 {
     JsonValue array = JsonValue::MakeArray();
+    const InstructionIndex instructionByAddress = BuildInstructionIndex(request);
     const std::vector<size_t> indices = SelectSpreadIndices(request.Facts.MemoryAccesses.size(), kPromptMemoryAccessLimit);
 
     if (truncated != nullptr)
@@ -1642,7 +1853,13 @@ JsonValue BuildMemoryAccessesJson(const AnalyzeRequest& request, bool* truncated
         item.Set("scale", JsonValue::MakeNumber(static_cast<double>(access.Scale)));
         item.Set("displacement", JsonValue::MakeString(access.Displacement));
         item.Set("rip_relative", JsonValue::MakeBoolean(access.RipRelative));
-        const DisassembledInstruction* instruction = FindInstructionByAddress(request, access.Site);
+        item.Set("implicit", JsonValue::MakeBoolean(access.Implicit));
+        item.Set("semantic", JsonValue::MakeString(access.Semantic));
+        item.Set("stack_frame_relative", JsonValue::MakeBoolean(access.StackFrameRelative));
+        item.Set("frame_base", JsonValue::MakeString(access.FrameBase));
+        item.Set("frame_offset", JsonValue::MakeString(HexS64(access.FrameOffset)));
+        item.Set("stack_pointer_delta", JsonValue::MakeString(HexS64(access.StackPointerDelta)));
+        const DisassembledInstruction* instruction = FindInstructionByAddress(instructionByAddress, access.Site);
         item.Set("instruction", JsonValue::MakeString(instruction != nullptr ? BuildInstructionPreview(*instruction) : std::string()));
         array.PushBack(item);
     }
@@ -1694,6 +1911,8 @@ JsonValue BuildRecoveredLocalsJson(const AnalyzeRequest& request, bool* truncate
         item.Set("name", JsonValue::MakeString(local.Name));
         item.Set("base_register", JsonValue::MakeString(local.BaseRegister));
         item.Set("offset", JsonValue::MakeString(HexS64(local.Offset)));
+        item.Set("raw_base_register", JsonValue::MakeString(local.RawBaseRegister));
+        item.Set("raw_offset", JsonValue::MakeString(HexS64(local.RawOffset)));
         item.Set("storage", JsonValue::MakeString(local.Storage));
         item.Set("type_hint", JsonValue::MakeString(local.TypeHint));
         item.Set("role_hint", JsonValue::MakeString(local.RoleHint));
@@ -1706,6 +1925,152 @@ JsonValue BuildRecoveredLocalsJson(const AnalyzeRequest& request, bool* truncate
     }
 
     return array;
+}
+
+JsonValue BuildStackPointerJson(const AnalyzeRequest& request, bool* truncated)
+{
+    JsonValue array = JsonValue::MakeArray();
+    const std::vector<size_t> indices = SelectSpreadIndices(request.Facts.StackPointer.size(), kPromptStackPointerLimit);
+
+    if (truncated != nullptr)
+    {
+        *truncated = request.Facts.StackPointer.size() > indices.size();
+    }
+
+    for (size_t index : indices)
+    {
+        const StackPointerFact& fact = request.Facts.StackPointer[index];
+        JsonValue item = JsonValue::MakeObject();
+        item.Set("site", JsonValue::MakeString(HexU64(fact.Site)));
+        item.Set("delta_before", JsonValue::MakeString(HexS64(fact.DeltaBefore)));
+        item.Set("delta_after", JsonValue::MakeString(HexS64(fact.DeltaAfter)));
+        item.Set("frame_pointer_delta", JsonValue::MakeString(HexS64(fact.FramePointerDelta)));
+        item.Set("known", JsonValue::MakeBoolean(fact.Known));
+        item.Set("frame_pointer_known", JsonValue::MakeBoolean(fact.FramePointerKnown));
+        item.Set("confidence", JsonValue::MakeNumber(fact.Confidence));
+        array.PushBack(item);
+    }
+
+    return array;
+}
+
+struct CallArgumentPromptGroup
+{
+    uint64_t Site = 0;
+    std::vector<size_t> ArgumentIndices;
+};
+
+JsonValue BuildCallArgumentJsonItem(const CallArgumentFact& argument)
+{
+    JsonValue item = JsonValue::MakeObject();
+    item.Set("ordinal", JsonValue::MakeNumber(static_cast<double>(argument.Ordinal)));
+    item.Set("location", JsonValue::MakeString(argument.Location));
+    item.Set("expression", JsonValue::MakeString(argument.Expression));
+    item.Set("type_hint", JsonValue::MakeString(argument.TypeHint));
+    item.Set("source", JsonValue::MakeString(argument.Source));
+    item.Set("confidence", JsonValue::MakeNumber(argument.Confidence));
+    return item;
+}
+
+JsonValue BuildPrototypeParametersJson(const std::vector<PrototypeParameter>& parameters, size_t limit, bool* truncated)
+{
+    JsonValue array = JsonValue::MakeArray();
+    const size_t count = (std::min)(parameters.size(), limit);
+
+    if (truncated != nullptr)
+    {
+        *truncated = parameters.size() > count;
+    }
+
+    for (size_t index = 0; index < count; ++index)
+    {
+        const PrototypeParameter& parameter = parameters[index];
+        JsonValue item = JsonValue::MakeObject();
+        item.Set("ordinal", JsonValue::MakeNumber(static_cast<double>(parameter.Ordinal)));
+        item.Set("name", JsonValue::MakeString(parameter.Name));
+        item.Set("type", JsonValue::MakeString(parameter.Type));
+        item.Set("location", JsonValue::MakeString(parameter.Location));
+        item.Set("confidence", JsonValue::MakeNumber(parameter.Confidence));
+        array.PushBack(item);
+    }
+
+    return array;
+}
+
+std::vector<CallArgumentPromptGroup> BuildCallArgumentPromptGroups(
+    const AnalyzeRequest& request,
+    const std::set<uint64_t>* instructionAddresses)
+{
+    std::vector<CallArgumentPromptGroup> groups;
+
+    for (size_t index = 0; index < request.Facts.CallArguments.size(); ++index)
+    {
+        const CallArgumentFact& argument = request.Facts.CallArguments[index];
+
+        if (instructionAddresses != nullptr && instructionAddresses->find(argument.Site) == instructionAddresses->end())
+        {
+            continue;
+        }
+
+        auto groupIt = std::find_if(
+            groups.begin(),
+            groups.end(),
+            [&argument](const CallArgumentPromptGroup& group)
+            {
+                return group.Site == argument.Site;
+            });
+
+        if (groupIt == groups.end())
+        {
+            CallArgumentPromptGroup group;
+            group.Site = argument.Site;
+            groups.push_back(std::move(group));
+            groupIt = groups.end() - 1;
+        }
+
+        groupIt->ArgumentIndices.push_back(index);
+    }
+
+    return groups;
+}
+
+JsonValue BuildCallArgumentGroupsJson(
+    const AnalyzeRequest& request,
+    const std::vector<CallArgumentPromptGroup>& groups,
+    bool* truncated)
+{
+    JsonValue array = JsonValue::MakeArray();
+    const std::vector<size_t> sampled = SelectSpreadIndices(groups.size(), kPromptCallArgumentLimit);
+
+    if (truncated != nullptr)
+    {
+        *truncated = groups.size() > sampled.size();
+    }
+
+    for (size_t relativeIndex : sampled)
+    {
+        const CallArgumentPromptGroup& group = groups[relativeIndex];
+        JsonValue item = JsonValue::MakeObject();
+        JsonValue arguments = JsonValue::MakeArray();
+
+        item.Set("site", JsonValue::MakeString(HexU64(group.Site)));
+        item.Set("argument_count", JsonValue::MakeNumber(static_cast<double>(group.ArgumentIndices.size())));
+
+        for (const size_t argumentIndex : group.ArgumentIndices)
+        {
+            arguments.PushBack(BuildCallArgumentJsonItem(request.Facts.CallArguments[argumentIndex]));
+        }
+
+        item.Set("arguments", arguments);
+        array.PushBack(item);
+    }
+
+    return array;
+}
+
+JsonValue BuildCallArgumentsJson(const AnalyzeRequest& request, bool* truncated)
+{
+    return BuildCallArgumentGroupsJson(request, BuildCallArgumentPromptGroups(request, nullptr), truncated);
 }
 
 JsonValue BuildValueMergesJson(const AnalyzeRequest& request, bool* truncated)
@@ -1736,7 +2101,13 @@ JsonValue BuildValueMergesJson(const AnalyzeRequest& request, bool* truncated)
 JsonValue BuildIrValuesJson(const AnalyzeRequest& request, bool* truncated)
 {
     JsonValue array = JsonValue::MakeArray();
-    const std::vector<size_t> indices = SelectSpreadIndices(request.Facts.IrValues.size(), kPromptIrValueLimit);
+    const std::vector<size_t> indices = SelectRankedSpreadIndices(
+        request.Facts.IrValues.size(),
+        kPromptIrValueLimit,
+        [&request](size_t index)
+        {
+            return ScorePromptIrValue(request.Facts.IrValues[index]);
+        });
 
     if (truncated != nullptr)
     {
@@ -1786,6 +2157,11 @@ JsonValue BuildControlFlowJson(const AnalyzeRequest& request, bool* truncated)
         item.Set("exit_blocks", BuildStringArray(region.ExitBlocks, 8, nullptr));
         item.Set("condition", JsonValue::MakeString(region.Condition));
         item.Set("evidence", JsonValue::MakeString(region.Evidence));
+        item.Set("induction_variable", JsonValue::MakeString(region.InductionVariable));
+        item.Set("initial_value", JsonValue::MakeString(region.InitialValue));
+        item.Set("step", JsonValue::MakeString(region.Step));
+        item.Set("bound", JsonValue::MakeString(region.Bound));
+        item.Set("direction", JsonValue::MakeString(region.Direction));
         item.Set("confidence", JsonValue::MakeNumber(region.Confidence));
         array.PushBack(item);
     }
@@ -1829,7 +2205,13 @@ JsonValue BuildAbiJson(const AnalyzeRequest& request, bool* truncated)
 JsonValue BuildTypeHintsJson(const AnalyzeRequest& request, bool* truncated)
 {
     JsonValue array = JsonValue::MakeArray();
-    const std::vector<size_t> indices = SelectSpreadIndices(request.Facts.TypeHints.size(), kPromptTypeHintLimit);
+    const std::vector<size_t> indices = SelectRankedSpreadIndices(
+        request.Facts.TypeHints.size(),
+        kPromptTypeHintLimit,
+        [&request](size_t index)
+        {
+            return ScorePromptTypeHint(request.Facts.TypeHints[index]);
+        });
 
     if (truncated != nullptr)
     {
@@ -1887,7 +2269,13 @@ JsonValue BuildIdiomsJson(const AnalyzeRequest& request, bool* truncated)
 JsonValue BuildCalleeSummariesJson(const AnalyzeRequest& request, bool* truncated)
 {
     JsonValue array = JsonValue::MakeArray();
-    const std::vector<size_t> indices = SelectSpreadIndices(request.Facts.CalleeSummaries.size(), kPromptCalleeSummaryLimit);
+    const std::vector<size_t> indices = SelectRankedSpreadIndices(
+        request.Facts.CalleeSummaries.size(),
+        kPromptCalleeSummaryLimit,
+        [&request](size_t index)
+        {
+            return ScorePromptCalleeSummary(request.Facts.CalleeSummaries[index]);
+        });
 
     if (truncated != nullptr)
     {
@@ -1906,6 +2294,8 @@ JsonValue BuildCalleeSummariesJson(const AnalyzeRequest& request, bool* truncate
         item.Set("memory_effects", JsonValue::MakeString(summary.MemoryEffects));
         item.Set("ownership", JsonValue::MakeString(summary.Ownership));
         item.Set("source", JsonValue::MakeString(summary.Source));
+        item.Set("parameters", BuildPrototypeParametersJson(summary.Parameters, 16, nullptr));
+        item.Set("tail_call", JsonValue::MakeBoolean(summary.TailCall));
         item.Set("confidence", JsonValue::MakeNumber(summary.Confidence));
         array.PushBack(item);
     }
@@ -1945,7 +2335,13 @@ JsonValue BuildDataReferencesJson(const AnalyzeRequest& request, bool* truncated
 JsonValue BuildCallTargetsJson(const AnalyzeRequest& request, bool* truncated)
 {
     JsonValue array = JsonValue::MakeArray();
-    const std::vector<size_t> indices = SelectSpreadIndices(request.Facts.CallTargets.size(), kPromptCallTargetLimit);
+    const std::vector<size_t> indices = SelectRankedSpreadIndices(
+        request.Facts.CallTargets.size(),
+        kPromptCallTargetLimit,
+        [&request](size_t index)
+        {
+            return ScorePromptCallTarget(request.Facts.CallTargets[index]);
+        });
 
     if (truncated != nullptr)
     {
@@ -1964,7 +2360,14 @@ JsonValue BuildCallTargetsJson(const AnalyzeRequest& request, bool* truncated)
         item.Set("prototype", JsonValue::MakeString(call.Prototype));
         item.Set("return_type", JsonValue::MakeString(call.ReturnType));
         item.Set("side_effects", JsonValue::MakeString(call.SideEffects));
+        item.Set("memory_effects", JsonValue::MakeString(call.MemoryEffects));
+        item.Set("ownership", JsonValue::MakeString(call.Ownership));
+        item.Set("target_expression", JsonValue::MakeString(call.TargetExpression));
+        item.Set("vtable_offset", JsonValue::MakeNumber(static_cast<double>(call.VtableOffset)));
         item.Set("indirect", JsonValue::MakeBoolean(call.Indirect));
+        item.Set("tail_call", JsonValue::MakeBoolean(call.TailCall));
+        item.Set("virtual_call", JsonValue::MakeBoolean(call.VirtualCall));
+        item.Set("parameters", BuildPrototypeParametersJson(call.Parameters, 16, nullptr));
         item.Set("confidence", JsonValue::MakeNumber(call.Confidence));
         array.PushBack(item);
     }
@@ -2018,6 +2421,7 @@ JsonValue BuildPdbFactsJson(const AnalyzeRequest& request, bool* truncated)
     const std::vector<size_t> conflictIndices = SelectSpreadIndices(request.Facts.Pdb.Conflicts.size(), kPromptPdbConflictLimit);
 
     anyTruncated = anyTruncated
+        || request.Facts.Pdb.PrototypeParameters.size() > 16
         || request.Facts.Pdb.Params.size() > paramIndices.size()
         || request.Facts.Pdb.Locals.size() > localIndices.size()
         || request.Facts.Pdb.FieldHints.size() > fieldIndices.size()
@@ -2102,6 +2506,7 @@ JsonValue BuildPdbFactsJson(const AnalyzeRequest& request, bool* truncated)
     object.Set("function_name", JsonValue::MakeString(request.Facts.Pdb.FunctionName));
     object.Set("prototype", JsonValue::MakeString(request.Facts.Pdb.Prototype));
     object.Set("return_type", JsonValue::MakeString(request.Facts.Pdb.ReturnType));
+    object.Set("prototype_parameters", BuildPrototypeParametersJson(request.Facts.Pdb.PrototypeParameters, 16, nullptr));
     object.Set("params", params);
     object.Set("locals", locals);
     object.Set("field_hints", fieldHints);
@@ -2210,9 +2615,11 @@ JsonValue BuildCountsJson(const AnalyzeRequest& request)
     counts.Set("direct_calls_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.Calls.size())));
     counts.Set("indirect_calls_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.IndirectCalls.size())));
     counts.Set("switches_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.Switches.size())));
+    counts.Set("stack_pointer_facts_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.StackPointer.size())));
     counts.Set("memory_accesses_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.MemoryAccesses.size())));
     counts.Set("recovered_arguments_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.RecoveredArguments.size())));
     counts.Set("recovered_locals_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.RecoveredLocals.size())));
+    counts.Set("call_arguments_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.CallArguments.size())));
     counts.Set("value_merges_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.ValueMerges.size())));
     counts.Set("ir_values_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.IrValues.size())));
     counts.Set("control_flow_regions_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.ControlFlow.size())));
@@ -2222,6 +2629,7 @@ JsonValue BuildCountsJson(const AnalyzeRequest& request)
     counts.Set("data_references_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.DataReferences.size())));
     counts.Set("call_targets_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.CallTargets.size())));
     counts.Set("normalized_conditions_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.NormalizedConditions.size())));
+    counts.Set("pdb_prototype_params_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.Pdb.PrototypeParameters.size())));
     counts.Set("pdb_params_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.Pdb.Params.size())));
     counts.Set("pdb_locals_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.Pdb.Locals.size())));
     counts.Set("pdb_field_hints_total", JsonValue::MakeNumber(static_cast<double>(request.Facts.Pdb.FieldHints.size())));
@@ -2274,6 +2682,7 @@ JsonValue BuildGraphSummaryJson(const AnalyzeRequest& request)
         conditions.PushBack(item);
     }
 
+    const InstructionIndex instructionByAddress = BuildInstructionIndex(request);
     const std::vector<size_t> blockIndices = SelectRepresentativeBlockIndices(request);
 
     for (size_t selectedIndex : blockIndices)
@@ -2283,10 +2692,10 @@ JsonValue BuildGraphSummaryJson(const AnalyzeRequest& request)
         item.Set("id", JsonValue::MakeString(block.Id));
         item.Set("succ", BuildStringArray(block.Successors, 8, nullptr));
         item.Set("instruction_count", JsonValue::MakeNumber(static_cast<double>(block.InstructionAddresses.size())));
-        item.Set("has_direct_call", JsonValue::MakeBoolean(BlockContainsCallKind(request, block, false)));
-        item.Set("has_indirect_call", JsonValue::MakeBoolean(BlockContainsCallKind(request, block, true)));
-        item.Set("has_conditional_branch", JsonValue::MakeBoolean(BlockContainsConditionalBranch(request, block)));
-        item.Set("has_return", JsonValue::MakeBoolean(BlockContainsReturn(request, block)));
+        item.Set("has_direct_call", JsonValue::MakeBoolean(BlockContainsCallKind(instructionByAddress, block, false)));
+        item.Set("has_indirect_call", JsonValue::MakeBoolean(BlockContainsCallKind(instructionByAddress, block, true)));
+        item.Set("has_conditional_branch", JsonValue::MakeBoolean(BlockContainsConditionalBranch(instructionByAddress, block)));
+        item.Set("has_return", JsonValue::MakeBoolean(BlockContainsReturn(instructionByAddress, block)));
         importantBlocks.PushBack(item);
     }
 
@@ -2311,9 +2720,11 @@ JsonValue BuildPromptFactsJson(const AnalyzeRequest& request)
     bool directCallsTruncated = false;
     bool indirectCallsTruncated = false;
     bool switchesTruncated = false;
+    bool stackPointerTruncated = false;
     bool memoryAccessesTruncated = false;
     bool recoveredArgumentsTruncated = false;
     bool recoveredLocalsTruncated = false;
+    bool callArgumentsTruncated = false;
     bool valueMergesTruncated = false;
     bool irValuesTruncated = false;
     bool controlFlowTruncated = false;
@@ -2344,6 +2755,7 @@ JsonValue BuildPromptFactsJson(const AnalyzeRequest& request)
     stackFrame.Set("frame_pointer", JsonValue::MakeBoolean(request.Facts.StackFrame.FramePointer));
 
     selection.Set("block_strategy", JsonValue::MakeString("entry + feature-heavy blocks + spread sampling"));
+    selection.Set("fact_strategy", JsonValue::MakeString("ranked high-signal facts + spread sampling"));
     selection.Set("instruction_window_limit", JsonValue::MakeNumber(static_cast<double>(kPromptInstructionWindowLimit)));
     selection.Set("block_limit", JsonValue::MakeNumber(static_cast<double>(kPromptBlockLimit)));
 
@@ -2370,9 +2782,11 @@ JsonValue BuildPromptFactsJson(const AnalyzeRequest& request)
     root.Set("direct_calls", BuildCallsJson(request.Facts.Calls, kPromptDirectCallLimit, &directCallsTruncated));
     root.Set("indirect_calls", BuildCallsJson(request.Facts.IndirectCalls, kPromptIndirectCallLimit, &indirectCallsTruncated));
     root.Set("switches", BuildSwitchesJson(request, &switchesTruncated));
+    root.Set("stack_pointer", BuildStackPointerJson(request, &stackPointerTruncated));
     root.Set("memory_accesses", BuildMemoryAccessesJson(request, &memoryAccessesTruncated));
     root.Set("recovered_arguments", BuildRecoveredArgumentsJson(request, &recoveredArgumentsTruncated));
     root.Set("recovered_locals", BuildRecoveredLocalsJson(request, &recoveredLocalsTruncated));
+    root.Set("call_arguments", BuildCallArgumentsJson(request, &callArgumentsTruncated));
     root.Set("value_merges", BuildValueMergesJson(request, &valueMergesTruncated));
     root.Set("ir_values", BuildIrValuesJson(request, &irValuesTruncated));
     root.Set("control_flow", BuildControlFlowJson(request, &controlFlowTruncated));
@@ -2396,9 +2810,11 @@ JsonValue BuildPromptFactsJson(const AnalyzeRequest& request)
     truncation.Set("direct_calls", JsonValue::MakeBoolean(directCallsTruncated));
     truncation.Set("indirect_calls", JsonValue::MakeBoolean(indirectCallsTruncated));
     truncation.Set("switches", JsonValue::MakeBoolean(switchesTruncated));
+    truncation.Set("stack_pointer", JsonValue::MakeBoolean(stackPointerTruncated));
     truncation.Set("memory_accesses", JsonValue::MakeBoolean(memoryAccessesTruncated));
     truncation.Set("recovered_arguments", JsonValue::MakeBoolean(recoveredArgumentsTruncated));
     truncation.Set("recovered_locals", JsonValue::MakeBoolean(recoveredLocalsTruncated));
+    truncation.Set("call_arguments", JsonValue::MakeBoolean(callArgumentsTruncated));
     truncation.Set("value_merges", JsonValue::MakeBoolean(valueMergesTruncated));
     truncation.Set("ir_values", JsonValue::MakeBoolean(irValuesTruncated));
     truncation.Set("control_flow", JsonValue::MakeBoolean(controlFlowTruncated));
@@ -2467,71 +2883,286 @@ std::vector<ChunkPlan> BuildChunkPlans(
     const AnalyzeRequest& request,
     const LlmClientConfig& config)
 {
-    std::vector<ChunkPlan> plans;
     const size_t totalBlocks = request.Facts.Blocks.size();
+    std::vector<ChunkPlan> plans;
 
     if (totalBlocks == 0)
     {
         return plans;
     }
 
-    const size_t minimumBlocksPerChunk = (std::max)(static_cast<size_t>(4), static_cast<size_t>(config.ChunkBlockLimit));
+    const size_t maxBlocksPerChunk = (std::max)(static_cast<size_t>(4), static_cast<size_t>(config.ChunkBlockLimit));
     const size_t maxChunkCount = (std::max)(static_cast<size_t>(1), static_cast<size_t>(config.ChunkCountLimit));
-    size_t blocksPerChunk = minimumBlocksPerChunk;
+    std::unordered_map<std::string, size_t> blockIndexById;
+    std::vector<std::vector<size_t>> groups;
+    std::set<size_t> assigned;
 
-    if ((totalBlocks + blocksPerChunk - 1) / blocksPerChunk > maxChunkCount)
+    for (size_t index = 0; index < request.Facts.Blocks.size(); ++index)
     {
-        blocksPerChunk = (totalBlocks + maxChunkCount - 1) / maxChunkCount;
+        blockIndexById[request.Facts.Blocks[index].Id] = index;
     }
 
-    const size_t slotCount = (totalBlocks + blocksPerChunk - 1) / blocksPerChunk;
-
-    std::set<std::string> seenRanges;
-
-    for (size_t localIndex = 0; localIndex < slotCount; ++localIndex)
+    auto addUniqueIndex = [](std::vector<size_t>& values, size_t index)
     {
-        const size_t slot = localIndex;
-        size_t startBlock = slot * blocksPerChunk;
-
-        if (startBlock > kChunkOverlapBlocks)
+        if (std::find(values.begin(), values.end(), index) == values.end())
         {
-            startBlock -= kChunkOverlapBlocks;
+            values.push_back(index);
         }
-        else
+    };
+
+    auto findBlockContainingAddress = [&request](uint64_t address) -> size_t
+    {
+        for (size_t index = 0; index < request.Facts.Blocks.size(); ++index)
         {
-            startBlock = 0;
+            const BasicBlock& block = request.Facts.Blocks[index];
+
+            if (address >= block.StartAddress && address < block.EndAddress)
+            {
+                return index;
+            }
         }
 
-        size_t endBlock = slot * blocksPerChunk + blocksPerChunk + kChunkOverlapBlocks;
+        return static_cast<size_t>(-1);
+    };
 
-        if (endBlock > totalBlocks)
+    auto addGroup = [&](std::vector<size_t> group)
+    {
+        if (group.empty())
         {
-            endBlock = totalBlocks;
+            return;
         }
 
-        if (startBlock >= endBlock)
+        std::sort(group.begin(), group.end());
+        group.erase(std::unique(group.begin(), group.end()), group.end());
+
+        const size_t first = group.front();
+        const size_t last = group.back();
+
+        if (first > 0)
+        {
+            group.insert(group.begin(), first - 1U);
+        }
+
+        if (last + 1U < totalBlocks)
+        {
+            group.push_back(last + 1U);
+        }
+
+        std::sort(group.begin(), group.end());
+        group.erase(std::unique(group.begin(), group.end()), group.end());
+
+        groups.push_back(std::move(group));
+    };
+
+    for (const ControlFlowRegion& region : request.Facts.ControlFlow)
+    {
+        std::vector<size_t> group;
+        const auto headerIt = blockIndexById.find(region.HeaderBlock);
+
+        if (headerIt != blockIndexById.end())
+        {
+            addUniqueIndex(group, headerIt->second);
+        }
+
+        for (const std::string& blockId : region.BodyBlocks)
+        {
+            const auto it = blockIndexById.find(blockId);
+
+            if (it != blockIndexById.end())
+            {
+                addUniqueIndex(group, it->second);
+            }
+        }
+
+        for (const std::string& blockId : region.LatchBlocks)
+        {
+            const auto it = blockIndexById.find(blockId);
+
+            if (it != blockIndexById.end())
+            {
+                addUniqueIndex(group, it->second);
+            }
+        }
+
+        for (const std::string& blockId : region.ExitBlocks)
+        {
+            const auto it = blockIndexById.find(blockId);
+
+            if (it != blockIndexById.end())
+            {
+                addUniqueIndex(group, it->second);
+            }
+        }
+
+        addGroup(std::move(group));
+    }
+
+    for (const SwitchInfo& switchInfo : request.Facts.Switches)
+    {
+        std::vector<size_t> group;
+        const size_t headerIndex = findBlockContainingAddress(switchInfo.Site);
+
+        if (headerIndex != static_cast<size_t>(-1))
+        {
+            addUniqueIndex(group, headerIndex);
+        }
+
+        for (const uint64_t target : switchInfo.CaseTargets)
+        {
+            const size_t targetIndex = findBlockContainingAddress(target);
+
+            if (targetIndex != static_cast<size_t>(-1))
+            {
+                addUniqueIndex(group, targetIndex);
+            }
+        }
+
+        addGroup(std::move(group));
+    }
+
+    std::sort(
+        groups.begin(),
+        groups.end(),
+        [](const std::vector<size_t>& left, const std::vector<size_t>& right)
+        {
+            return left.empty() ? false : right.empty() ? true : left.front() < right.front();
+        });
+
+    std::vector<std::vector<size_t>> mergedGroups;
+
+    for (const std::vector<size_t>& group : groups)
+    {
+        if (group.empty())
         {
             continue;
         }
 
-        const std::string rangeKey = std::to_string(startBlock) + ":" + std::to_string(endBlock);
+        if (!mergedGroups.empty())
+        {
+            std::vector<size_t>& previous = mergedGroups.back();
+            const bool overlapsOrTouches = group.front() <= previous.back() + kChunkOverlapBlocks + 1U;
 
-        if (!seenRanges.insert(rangeKey).second)
+            if (overlapsOrTouches && previous.size() + group.size() <= maxBlocksPerChunk + (kChunkOverlapBlocks * 2U))
+            {
+                previous.insert(previous.end(), group.begin(), group.end());
+                std::sort(previous.begin(), previous.end());
+                previous.erase(std::unique(previous.begin(), previous.end()), previous.end());
+                continue;
+            }
+        }
+
+        mergedGroups.push_back(group);
+    }
+
+    for (const std::vector<size_t>& group : mergedGroups)
+    {
+        for (const size_t blockIndex : group)
+        {
+            assigned.insert(blockIndex);
+        }
+    }
+
+    groups = mergedGroups;
+
+    for (size_t blockIndex = 0; blockIndex < totalBlocks;)
+    {
+        if (assigned.find(blockIndex) != assigned.end())
+        {
+            ++blockIndex;
+            continue;
+        }
+
+        std::vector<size_t> group;
+
+        while (blockIndex < totalBlocks
+            && assigned.find(blockIndex) == assigned.end()
+            && group.size() < maxBlocksPerChunk)
+        {
+            group.push_back(blockIndex);
+            assigned.insert(blockIndex);
+            ++blockIndex;
+        }
+
+        addGroup(std::move(group));
+    }
+
+    std::sort(
+        groups.begin(),
+        groups.end(),
+        [](const std::vector<size_t>& left, const std::vector<size_t>& right)
+        {
+            return left.empty() ? false : right.empty() ? true : left.front() < right.front();
+        });
+
+    if (groups.empty())
+    {
+        for (size_t start = 0; start < totalBlocks; start += maxBlocksPerChunk)
+        {
+            std::vector<size_t> group;
+            const size_t end = (std::min)(totalBlocks, start + maxBlocksPerChunk);
+
+            for (size_t index = start; index < end; ++index)
+            {
+                group.push_back(index);
+            }
+
+            groups.push_back(std::move(group));
+        }
+    }
+
+    while (groups.size() > maxChunkCount && groups.size() > 1)
+    {
+        size_t bestIndex = 0;
+        size_t bestSize = static_cast<size_t>(-1);
+
+        for (size_t index = 0; index + 1U < groups.size(); ++index)
+        {
+            const size_t combinedSize = groups[index].size() + groups[index + 1U].size();
+
+            if (combinedSize < bestSize)
+            {
+                bestSize = combinedSize;
+                bestIndex = index;
+            }
+        }
+
+        groups[bestIndex].insert(groups[bestIndex].end(), groups[bestIndex + 1U].begin(), groups[bestIndex + 1U].end());
+        std::sort(groups[bestIndex].begin(), groups[bestIndex].end());
+        groups[bestIndex].erase(std::unique(groups[bestIndex].begin(), groups[bestIndex].end()), groups[bestIndex].end());
+        groups.erase(groups.begin() + static_cast<std::ptrdiff_t>(bestIndex + 1U));
+    }
+
+    std::set<std::string> seenKeys;
+
+    for (size_t index = 0; index < groups.size(); ++index)
+    {
+        std::vector<size_t>& group = groups[index];
+
+        std::sort(group.begin(), group.end());
+        group.erase(std::unique(group.begin(), group.end()), group.end());
+
+        if (group.empty())
+        {
+            continue;
+        }
+
+        std::string key;
+
+        for (const size_t blockIndex : group)
+        {
+            key += std::to_string(blockIndex) + ",";
+        }
+
+        if (!seenKeys.insert(key).second)
         {
             continue;
         }
 
         ChunkPlan plan;
-        plan.Id = "chunk_" + std::to_string(localIndex);
-        plan.SlotIndex = localIndex;
-        plan.TotalChunks = slotCount;
-
-        for (size_t blockIndex = startBlock; blockIndex < endBlock; ++blockIndex)
-        {
-            plan.BlockIndices.push_back(blockIndex);
-        }
-
-        plans.push_back(plan);
+        plan.Id = "chunk_" + std::to_string(plans.size());
+        plan.SlotIndex = plans.size();
+        plan.BlockIndices = group;
+        plans.push_back(std::move(plan));
     }
 
     for (ChunkPlan& plan : plans)
@@ -2744,6 +3375,7 @@ JsonValue BuildBlocksJsonForIndices(
     const std::vector<size_t>& indices)
 {
     JsonValue blocks = JsonValue::MakeArray();
+    const InstructionIndex instructionByAddress = BuildInstructionIndex(request);
 
     for (size_t selectedIndex : indices)
     {
@@ -2759,9 +3391,9 @@ JsonValue BuildBlocksJsonForIndices(
         const size_t headCount = block.InstructionAddresses.size() < kPromptBlockInstructionLimit ? block.InstructionAddresses.size() : kPromptBlockInstructionLimit;
         const size_t tailCount = block.InstructionAddresses.size() < 6 ? block.InstructionAddresses.size() : 6;
 
-        for (size_t instructionIndex = 0; instructionIndex < headCount; ++instructionIndex)
+        for (size_t instructionOffset = 0; instructionOffset < headCount; ++instructionOffset)
         {
-            const DisassembledInstruction* instruction = FindInstructionByAddress(request, block.InstructionAddresses[instructionIndex]);
+            const DisassembledInstruction* instruction = FindInstructionByAddress(instructionByAddress, block.InstructionAddresses[instructionOffset]);
 
             if (instruction != nullptr)
             {
@@ -2771,9 +3403,9 @@ JsonValue BuildBlocksJsonForIndices(
 
         if (block.InstructionAddresses.size() > tailCount)
         {
-            for (size_t instructionIndex = block.InstructionAddresses.size() - tailCount; instructionIndex < block.InstructionAddresses.size(); ++instructionIndex)
+            for (size_t instructionOffset = block.InstructionAddresses.size() - tailCount; instructionOffset < block.InstructionAddresses.size(); ++instructionOffset)
             {
-                const DisassembledInstruction* instruction = FindInstructionByAddress(request, block.InstructionAddresses[instructionIndex]);
+                const DisassembledInstruction* instruction = FindInstructionByAddress(instructionByAddress, block.InstructionAddresses[instructionOffset]);
 
                 if (instruction != nullptr)
                 {
@@ -2788,11 +3420,11 @@ JsonValue BuildBlocksJsonForIndices(
         item.Set("succ", BuildStringArray(block.Successors, 12, nullptr));
         item.Set("terminal", JsonValue::MakeBoolean(block.HasTerminal));
         item.Set("instruction_count", JsonValue::MakeNumber(static_cast<double>(block.InstructionAddresses.size())));
-        item.Set("memory_access_count", JsonValue::MakeNumber(static_cast<double>(CountBlockMemoryAccesses(request, block))));
-        item.Set("has_direct_call", JsonValue::MakeBoolean(BlockContainsCallKind(request, block, false)));
-        item.Set("has_indirect_call", JsonValue::MakeBoolean(BlockContainsCallKind(request, block, true)));
-        item.Set("has_return", JsonValue::MakeBoolean(BlockContainsReturn(request, block)));
-        item.Set("has_conditional_branch", JsonValue::MakeBoolean(BlockContainsConditionalBranch(request, block)));
+        item.Set("memory_access_count", JsonValue::MakeNumber(static_cast<double>(CountBlockMemoryAccesses(instructionByAddress, block))));
+        item.Set("has_direct_call", JsonValue::MakeBoolean(BlockContainsCallKind(instructionByAddress, block, false)));
+        item.Set("has_indirect_call", JsonValue::MakeBoolean(BlockContainsCallKind(instructionByAddress, block, true)));
+        item.Set("has_return", JsonValue::MakeBoolean(BlockContainsReturn(instructionByAddress, block)));
+        item.Set("has_conditional_branch", JsonValue::MakeBoolean(BlockContainsConditionalBranch(instructionByAddress, block)));
         item.Set("insn_head_sample", instructionHeadSample);
         item.Set("insn_tail_sample", instructionTailSample);
         blocks.PushBack(item);
@@ -2850,7 +3482,14 @@ JsonValue BuildSwitchesJsonForAddresses(
 
     for (size_t index = 0; index < request.Facts.Switches.size(); ++index)
     {
-        if (instructionAddresses.find(request.Facts.Switches[index].Site) != instructionAddresses.end())
+        bool include = instructionAddresses.find(request.Facts.Switches[index].Site) != instructionAddresses.end();
+
+        for (const uint64_t target : request.Facts.Switches[index].CaseTargets)
+        {
+            include = include || instructionAddresses.find(target) != instructionAddresses.end();
+        }
+
+        if (include)
         {
             filteredIndices.push_back(index);
         }
@@ -2862,15 +3501,37 @@ JsonValue BuildSwitchesJsonForAddresses(
     }
 
     JsonValue array = JsonValue::MakeArray();
-    const std::vector<size_t> sampled = SelectSpreadIndices(filteredIndices.size(), kPromptSwitchLimit);
+    const std::vector<size_t> sampled = SelectRankedSpreadIndices(
+        filteredIndices.size(),
+        kPromptSwitchLimit,
+        [&request, &filteredIndices](size_t relativeIndex)
+        {
+            return ScorePromptSwitch(request.Facts.Switches[filteredIndices[relativeIndex]]);
+        });
 
     for (size_t relativeIndex : sampled)
     {
         const SwitchInfo& info = request.Facts.Switches[filteredIndices[relativeIndex]];
         JsonValue item = JsonValue::MakeObject();
+        JsonValue targets = JsonValue::MakeArray();
+
+        for (size_t targetIndex = 0; targetIndex < info.CaseTargets.size() && targetIndex < 32; ++targetIndex)
+        {
+            targets.PushBack(JsonValue::MakeString(HexU64(info.CaseTargets[targetIndex])));
+        }
+
         item.Set("site", JsonValue::MakeString(HexU64(info.Site)));
+        item.Set("table_address", JsonValue::MakeString(HexU64(info.TableAddress)));
         item.Set("case_count", JsonValue::MakeNumber(static_cast<double>(info.CaseCount)));
+        item.Set("default_target", JsonValue::MakeString(HexU64(info.DefaultTarget)));
+        item.Set("range_min", JsonValue::MakeString(HexS64(info.RangeMin)));
+        item.Set("range_max", JsonValue::MakeString(HexS64(info.RangeMax)));
+        item.Set("range_known", JsonValue::MakeBoolean(info.RangeKnown));
+        item.Set("signed_index", JsonValue::MakeBoolean(info.SignedIndex));
         item.Set("detail", JsonValue::MakeString(info.Detail));
+        item.Set("index_expression", JsonValue::MakeString(info.IndexExpression));
+        item.Set("case_targets", targets);
+        item.Set("case_targets_truncated", JsonValue::MakeBoolean(info.CaseTargets.size() > 32));
         array.PushBack(item);
     }
 
@@ -2882,6 +3543,7 @@ JsonValue BuildMemoryAccessesJsonForAddresses(
     const std::set<uint64_t>& instructionAddresses,
     bool* truncated)
 {
+    const InstructionIndex instructionByAddress = BuildInstructionIndex(request);
     std::vector<size_t> filteredIndices;
 
     for (size_t index = 0; index < request.Facts.MemoryAccesses.size(); ++index)
@@ -2914,7 +3576,13 @@ JsonValue BuildMemoryAccessesJsonForAddresses(
         item.Set("scale", JsonValue::MakeNumber(static_cast<double>(access.Scale)));
         item.Set("displacement", JsonValue::MakeString(access.Displacement));
         item.Set("rip_relative", JsonValue::MakeBoolean(access.RipRelative));
-        const DisassembledInstruction* instruction = FindInstructionByAddress(request, access.Site);
+        item.Set("implicit", JsonValue::MakeBoolean(access.Implicit));
+        item.Set("semantic", JsonValue::MakeString(access.Semantic));
+        item.Set("stack_frame_relative", JsonValue::MakeBoolean(access.StackFrameRelative));
+        item.Set("frame_base", JsonValue::MakeString(access.FrameBase));
+        item.Set("frame_offset", JsonValue::MakeString(HexS64(access.FrameOffset)));
+        item.Set("stack_pointer_delta", JsonValue::MakeString(HexS64(access.StackPointerDelta)));
+        const DisassembledInstruction* instruction = FindInstructionByAddress(instructionByAddress, access.Site);
         item.Set("instruction", JsonValue::MakeString(instruction != nullptr ? BuildInstructionPreview(*instruction) : std::string()));
         array.PushBack(item);
     }
@@ -2985,7 +3653,13 @@ JsonValue BuildCallTargetsJsonForAddresses(
     }
 
     JsonValue array = JsonValue::MakeArray();
-    const std::vector<size_t> sampled = SelectSpreadIndices(filteredIndices.size(), kPromptCallTargetLimit);
+    const std::vector<size_t> sampled = SelectRankedSpreadIndices(
+        filteredIndices.size(),
+        kPromptCallTargetLimit,
+        [&request, &filteredIndices](size_t relativeIndex)
+        {
+            return ScorePromptCallTarget(request.Facts.CallTargets[filteredIndices[relativeIndex]]);
+        });
 
     for (size_t relativeIndex : sampled)
     {
@@ -2999,12 +3673,27 @@ JsonValue BuildCallTargetsJsonForAddresses(
         item.Set("prototype", JsonValue::MakeString(call.Prototype));
         item.Set("return_type", JsonValue::MakeString(call.ReturnType));
         item.Set("side_effects", JsonValue::MakeString(call.SideEffects));
+        item.Set("memory_effects", JsonValue::MakeString(call.MemoryEffects));
+        item.Set("ownership", JsonValue::MakeString(call.Ownership));
+        item.Set("target_expression", JsonValue::MakeString(call.TargetExpression));
+        item.Set("vtable_offset", JsonValue::MakeNumber(static_cast<double>(call.VtableOffset)));
         item.Set("indirect", JsonValue::MakeBoolean(call.Indirect));
+        item.Set("tail_call", JsonValue::MakeBoolean(call.TailCall));
+        item.Set("virtual_call", JsonValue::MakeBoolean(call.VirtualCall));
+        item.Set("parameters", BuildPrototypeParametersJson(call.Parameters, 16, nullptr));
         item.Set("confidence", JsonValue::MakeNumber(call.Confidence));
         array.PushBack(item);
     }
 
     return array;
+}
+
+JsonValue BuildCallArgumentsJsonForAddresses(
+    const AnalyzeRequest& request,
+    const std::set<uint64_t>& instructionAddresses,
+    bool* truncated)
+{
+    return BuildCallArgumentGroupsJson(request, BuildCallArgumentPromptGroups(request, &instructionAddresses), truncated);
 }
 
 JsonValue BuildNormalizedConditionsJsonForBlocks(
@@ -3085,6 +3774,169 @@ JsonValue BuildValueMergesJsonForBlocks(
     return array;
 }
 
+std::set<std::string> BuildBlockIdSetForPlan(const AnalyzeRequest& request, const ChunkPlan& plan)
+{
+    std::set<std::string> blockIds;
+
+    for (const size_t blockIndex : plan.BlockIndices)
+    {
+        if (blockIndex < request.Facts.Blocks.size())
+        {
+            blockIds.insert(request.Facts.Blocks[blockIndex].Id);
+        }
+    }
+
+    return blockIds;
+}
+
+std::unordered_map<std::string, std::vector<std::string>> BuildPromptBlockPredecessors(const std::vector<BasicBlock>& blocks)
+{
+    std::unordered_map<std::string, std::vector<std::string>> predecessors;
+
+    for (const BasicBlock& block : blocks)
+    {
+        for (const std::string& successor : block.Successors)
+        {
+            predecessors[successor].push_back(block.Id);
+        }
+    }
+
+    return predecessors;
+}
+
+JsonValue BuildBoundaryValueItem(const IrValue& value)
+{
+    JsonValue item = JsonValue::MakeObject();
+    item.Set("id", JsonValue::MakeString(value.Id));
+    item.Set("block_id", JsonValue::MakeString(value.BlockId));
+    item.Set("site", JsonValue::MakeString(HexU64(value.DefSite)));
+    item.Set("target", JsonValue::MakeString(value.Target));
+    item.Set("expression", JsonValue::MakeString(value.Expression));
+    item.Set("kind", JsonValue::MakeString(value.Kind));
+    item.Set("confidence", JsonValue::MakeNumber(value.Confidence));
+    return item;
+}
+
+JsonValue BuildChunkBoundaryJson(const AnalyzeRequest& request, const ChunkPlan& plan)
+{
+    JsonValue boundary = JsonValue::MakeObject();
+    JsonValue incomingEdges = JsonValue::MakeArray();
+    JsonValue outgoingEdges = JsonValue::MakeArray();
+    JsonValue liveInValues = JsonValue::MakeArray();
+    JsonValue liveOutValues = JsonValue::MakeArray();
+    JsonValue incomingConditions = JsonValue::MakeArray();
+    JsonValue outgoingConditions = JsonValue::MakeArray();
+    const std::set<std::string> chunkBlockIds = BuildBlockIdSetForPlan(request, plan);
+    const std::unordered_map<std::string, std::vector<std::string>> predecessors = BuildPromptBlockPredecessors(request.Facts.Blocks);
+    std::unordered_map<std::string, const IrValue*> valueById;
+    std::set<std::string> emittedLiveIn;
+    std::set<std::string> emittedLiveOut;
+
+    for (const IrValue& value : request.Facts.IrValues)
+    {
+        valueById[value.Id] = &value;
+    }
+
+    for (const BasicBlock& block : request.Facts.Blocks)
+    {
+        const bool blockInChunk = chunkBlockIds.find(block.Id) != chunkBlockIds.end();
+
+        if (blockInChunk)
+        {
+            const auto predecessorIt = predecessors.find(block.Id);
+
+            if (predecessorIt != predecessors.end())
+            {
+                for (const std::string& predecessor : predecessorIt->second)
+                {
+                    if (chunkBlockIds.find(predecessor) == chunkBlockIds.end())
+                    {
+                        JsonValue edge = JsonValue::MakeObject();
+                        edge.Set("from", JsonValue::MakeString(predecessor));
+                        edge.Set("to", JsonValue::MakeString(block.Id));
+                        incomingEdges.PushBack(edge);
+                    }
+                }
+            }
+
+            for (const std::string& successor : block.Successors)
+            {
+                if (chunkBlockIds.find(successor) == chunkBlockIds.end())
+                {
+                    JsonValue edge = JsonValue::MakeObject();
+                    edge.Set("from", JsonValue::MakeString(block.Id));
+                    edge.Set("to", JsonValue::MakeString(successor));
+                    outgoingEdges.PushBack(edge);
+                }
+            }
+        }
+    }
+
+    for (const IrValue& value : request.Facts.IrValues)
+    {
+        const bool valueInChunk = chunkBlockIds.find(value.BlockId) != chunkBlockIds.end();
+
+        for (const std::string& useId : value.Uses)
+        {
+            const auto usedIt = valueById.find(useId);
+
+            if (usedIt == valueById.end() || usedIt->second == nullptr)
+            {
+                continue;
+            }
+
+            const IrValue& used = *usedIt->second;
+            const bool usedInChunk = chunkBlockIds.find(used.BlockId) != chunkBlockIds.end();
+
+            if (valueInChunk && !usedInChunk && emittedLiveIn.insert(used.Id).second && liveInValues.GetArray().size() < 24)
+            {
+                liveInValues.PushBack(BuildBoundaryValueItem(used));
+            }
+
+            if (!valueInChunk && usedInChunk && emittedLiveOut.insert(used.Id).second && liveOutValues.GetArray().size() < 24)
+            {
+                liveOutValues.PushBack(BuildBoundaryValueItem(used));
+            }
+        }
+    }
+
+    for (const NormalizedCondition& condition : request.Facts.NormalizedConditions)
+    {
+        const bool conditionInChunk = chunkBlockIds.find(condition.BlockId) != chunkBlockIds.end();
+        const bool trueInChunk = chunkBlockIds.find(condition.TrueTargetBlock) != chunkBlockIds.end();
+        const bool falseInChunk = chunkBlockIds.find(condition.FalseTargetBlock) != chunkBlockIds.end();
+
+        if (!conditionInChunk && (trueInChunk || falseInChunk) && incomingConditions.GetArray().size() < 16)
+        {
+            JsonValue item = JsonValue::MakeObject();
+            item.Set("block_id", JsonValue::MakeString(condition.BlockId));
+            item.Set("expression", JsonValue::MakeString(condition.Expression));
+            item.Set("true_target", JsonValue::MakeString(condition.TrueTargetBlock));
+            item.Set("false_target", JsonValue::MakeString(condition.FalseTargetBlock));
+            incomingConditions.PushBack(item);
+        }
+
+        if (conditionInChunk && (!trueInChunk || !falseInChunk) && outgoingConditions.GetArray().size() < 16)
+        {
+            JsonValue item = JsonValue::MakeObject();
+            item.Set("block_id", JsonValue::MakeString(condition.BlockId));
+            item.Set("expression", JsonValue::MakeString(condition.Expression));
+            item.Set("true_target", JsonValue::MakeString(condition.TrueTargetBlock));
+            item.Set("false_target", JsonValue::MakeString(condition.FalseTargetBlock));
+            outgoingConditions.PushBack(item);
+        }
+    }
+
+    boundary.Set("incoming_edges", incomingEdges);
+    boundary.Set("outgoing_edges", outgoingEdges);
+    boundary.Set("live_in_values", liveInValues);
+    boundary.Set("live_out_values", liveOutValues);
+    boundary.Set("incoming_conditions", incomingConditions);
+    boundary.Set("outgoing_conditions", outgoingConditions);
+    boundary.Set("note", JsonValue::MakeString("Use live_in/live_out and crossing edges to preserve state across adjacent chunks without inventing omitted blocks."));
+    return boundary;
+}
+
 JsonValue BuildChunkFactsJson(
     const AnalyzeRequest& request,
     const ChunkPlan& plan)
@@ -3106,6 +3958,7 @@ JsonValue BuildChunkFactsJson(
     bool memoryAccessesTruncated = false;
     bool recoveredArgumentsTruncated = false;
     bool recoveredLocalsTruncated = false;
+    bool callArgumentsTruncated = false;
     bool valueMergesTruncated = false;
     bool dataReferencesTruncated = false;
     bool callTargetsTruncated = false;
@@ -3173,12 +4026,14 @@ JsonValue BuildChunkFactsJson(
     root.Set("chunk_instruction_window_middle", middleInstructionIndex.has_value() ? BuildInstructionWindowFromPointers(chunkInstructions, middleInstructionIndex.value()) : JsonValue::MakeArray());
     root.Set("chunk_instruction_window_tail", BuildInstructionWindowFromPointers(chunkInstructions, true));
     root.Set("blocks", BuildBlocksJsonForIndices(request, plan.BlockIndices));
+    root.Set("chunk_boundary", BuildChunkBoundaryJson(request, plan));
     root.Set("direct_calls", BuildCallsJsonForAddresses(request, request.Facts.Calls, instructionAddresses, 24, &directCallsTruncated));
     root.Set("indirect_calls", BuildCallsJsonForAddresses(request, request.Facts.IndirectCalls, instructionAddresses, 24, &indirectCallsTruncated));
     root.Set("switches", BuildSwitchesJsonForAddresses(request, instructionAddresses, &switchesTruncated));
     root.Set("memory_accesses", BuildMemoryAccessesJsonForAddresses(request, instructionAddresses, &memoryAccessesTruncated));
     root.Set("recovered_arguments", BuildRecoveredArgumentsJson(request, &recoveredArgumentsTruncated));
     root.Set("recovered_locals", BuildRecoveredLocalsJson(request, &recoveredLocalsTruncated));
+    root.Set("call_arguments", BuildCallArgumentsJsonForAddresses(request, instructionAddresses, &callArgumentsTruncated));
     root.Set("value_merges", BuildValueMergesJsonForBlocks(request, blockIds, &valueMergesTruncated));
     root.Set("data_references", BuildDataReferencesJsonForAddresses(request, instructionAddresses, &dataReferencesTruncated));
     root.Set("call_targets", BuildCallTargetsJsonForAddresses(request, instructionAddresses, &callTargetsTruncated));
@@ -3194,6 +4049,7 @@ JsonValue BuildChunkFactsJson(
     truncation.Set("memory_accesses", JsonValue::MakeBoolean(memoryAccessesTruncated));
     truncation.Set("recovered_arguments", JsonValue::MakeBoolean(recoveredArgumentsTruncated));
     truncation.Set("recovered_locals", JsonValue::MakeBoolean(recoveredLocalsTruncated));
+    truncation.Set("call_arguments", JsonValue::MakeBoolean(callArgumentsTruncated));
     truncation.Set("value_merges", JsonValue::MakeBoolean(valueMergesTruncated));
     truncation.Set("data_references", JsonValue::MakeBoolean(dataReferencesTruncated));
     truncation.Set("call_targets", JsonValue::MakeBoolean(callTargetsTruncated));
@@ -3547,6 +4403,7 @@ JsonValue BuildMergeFactsJson(
     bool regionsTruncated = false;
     bool recoveredArgumentsTruncated = false;
     bool recoveredLocalsTruncated = false;
+    bool callArgumentsTruncated = false;
     bool valueMergesTruncated = false;
     bool dataReferencesTruncated = false;
     bool callTargetsTruncated = false;
@@ -3600,6 +4457,7 @@ JsonValue BuildMergeFactsJson(
     root.Set("instruction_window_tail", BuildInstructionWindowJson(request, true));
     root.Set("recovered_arguments", BuildRecoveredArgumentsJson(request, &recoveredArgumentsTruncated));
     root.Set("recovered_locals", BuildRecoveredLocalsJson(request, &recoveredLocalsTruncated));
+    root.Set("call_arguments", BuildCallArgumentsJson(request, &callArgumentsTruncated));
     root.Set("value_merges", BuildValueMergesJson(request, &valueMergesTruncated));
     root.Set("data_references", BuildDataReferencesJson(request, &dataReferencesTruncated));
     root.Set("call_targets", BuildCallTargetsJson(request, &callTargetsTruncated));
@@ -3616,6 +4474,7 @@ JsonValue BuildMergeFactsJson(
     truncation.Set("regions", JsonValue::MakeBoolean(regionsTruncated));
     truncation.Set("recovered_arguments", JsonValue::MakeBoolean(recoveredArgumentsTruncated));
     truncation.Set("recovered_locals", JsonValue::MakeBoolean(recoveredLocalsTruncated));
+    truncation.Set("call_arguments", JsonValue::MakeBoolean(callArgumentsTruncated));
     truncation.Set("value_merges", JsonValue::MakeBoolean(valueMergesTruncated));
     truncation.Set("data_references", JsonValue::MakeBoolean(dataReferencesTruncated));
     truncation.Set("call_targets", JsonValue::MakeBoolean(callTargetsTruncated));
@@ -3635,7 +4494,7 @@ std::string BuildChunkSystemPrompt(const AnalyzeRequest& request)
         "Write summary_localized and uncertainties in the configured display language: " + DescribePreferredNaturalLanguage(request) + ". "
         "Keep pseudo_steps, state_updates, observed_calls, observed_memory, identifiers, and API names in English or C-style. "
         "Do not invent external call targets that are not present in the input. "
-        "Use recovered_arguments, recovered_locals, normalized_conditions, data_references, call_targets, and pdb facts as high-signal semantic hints when present. "
+        "Use recovered_arguments, recovered_locals, call_arguments, normalized_conditions, data_references, call_targets, and pdb facts as high-signal semantic hints when present. "
         "Prefer explicit memory reads, writes, compares, branches, and state transitions over vague summaries. "
         "When information is incomplete, preserve only the missing part as uncertain instead of collapsing the whole chunk into a short summary. "
         "The evidence field must be an array of objects shaped like {\"claim\": string, \"blocks\": [string, ...]}. Use evidence.blocks values that reference only valid basic block ids from the input chunk.";
@@ -3660,11 +4519,12 @@ std::string BuildChunkUserPrompt(
     prompt += ".\n";
     prompt += "3. Keep pseudo_steps and state_updates concrete and operation-focused.\n";
     prompt += "4. Preserve visible reads, writes, comparisons, and branches instead of replacing them with generic comments.\n";
-    prompt += "5. Use recovered_arguments, recovered_locals, normalized_conditions, data_references, call_targets, type_hints, idioms, callee_summaries, and pdb facts when they improve naming or type/side-effect hints.\n";
+    prompt += "5. Use recovered_arguments, recovered_locals, call_arguments, normalized_conditions, data_references, call_targets, type_hints, idioms, callee_summaries, and pdb facts when they improve naming or type/side-effect hints.\n";
     prompt += "6. If the chunk is partial, say what is missing, but still describe the concrete work visible in this chunk.\n";
     prompt += "7. evidence must be an array of objects shaped like {\\\"claim\\\": string, \\\"blocks\\\": [string, ...]}.\n";
     prompt += "8. evidence.blocks must reference only block ids present in this chunk.\n";
     prompt += "9. Use graph_summary to keep chunk-local control-flow claims aligned with function-level CFG evidence.\n";
+    prompt += "10. Use chunk_boundary live_in_values, live_out_values, and crossing edges to preserve state that enters or leaves this chunk.\n";
     return prompt;
 }
 
@@ -3676,7 +4536,7 @@ std::string BuildMergeSystemPrompt(const AnalyzeRequest& request)
         "Write summary and uncertainties in the configured display language: " + DescribePreferredNaturalLanguage(request) + ". "
         "Keep pseudo_c, params, locals, evidence, identifiers, and API names in English or C-style. "
         "Use the chunk summaries to produce a fuller function-level pseudocode than a single-pass summary. "
-        "Use recovered_arguments, recovered_locals, normalized_conditions, data_references, call_targets, value_merges, and pdb facts to preserve semantic names and control-flow intent. "
+        "Use recovered_arguments, recovered_locals, call_arguments, normalized_conditions, data_references, call_targets, value_merges, and pdb facts to preserve semantic names and control-flow intent. "
         "Prefer reconstructing concrete reads, writes, branches, and helper interactions when the chunk evidence supports them. "
         "Do not invent calls or fields that are not grounded by the chunk summaries or global facts. "
         "Use UNKNOWN_TYPE for uncertain types and preserve only the truly unresolved parts in uncertainties. The evidence field must be an array of objects shaped like {\"claim\": string, \"blocks\": [string, ...]}.";
@@ -3700,7 +4560,7 @@ std::string BuildMergeUserPrompt(
     prompt += ".\n";
     prompt += "3. Build a richer pseudo_c than a short high-level summary; use the chunk evidence to cover the main body.\n";
     prompt += "4. Preserve unknowns with UNKNOWN_TYPE instead of omitting entire regions of logic.\n";
-    prompt += "5. Use recovered_arguments, recovered_locals, normalized_conditions, data_references, call_targets, value_merges, type_hints, idioms, callee_summaries, and pdb facts when they help produce more concrete names or conditions.\n";
+    prompt += "5. Use recovered_arguments, recovered_locals, call_arguments, normalized_conditions, data_references, call_targets, value_merges, type_hints, idioms, callee_summaries, and pdb facts when they help produce more concrete names or conditions.\n";
     prompt += "6. If chunks disagree or coverage remains partial, explain that in uncertainties, but still keep the visible operations explicit.\n";
     prompt += "7. evidence must be an array of objects shaped like {\\\"claim\\\": string, \\\"blocks\\\": [string, ...]}.\n";
     prompt += "8. evidence.blocks must reference block ids that appear in the chunk summaries.\n";
@@ -3718,7 +4578,7 @@ std::string BuildSystemPrompt(const AnalyzeRequest& request)
         "Use UNKNOWN_TYPE for uncertain types. "
         "Write summary and uncertainties in the configured display language: " + DescribePreferredNaturalLanguage(request) + ". "
         "Keep pseudo_c, params, locals, evidence, identifiers, and API names in English or C-style as appropriate. "
-        "Use recovered_arguments, recovered_locals, normalized_conditions, data_references, call_targets, value_merges, type_hints, idioms, callee_summaries, graph_summary, session_policy, observed_behavior, and pdb facts as high-confidence semantic hints when available. "
+        "Use recovered_arguments, recovered_locals, call_arguments, normalized_conditions, data_references, call_targets, value_merges, type_hints, idioms, callee_summaries, graph_summary, session_policy, observed_behavior, and pdb facts as high-confidence semantic hints when available. "
         "Use evidence.blocks values that reference only valid basic block ids from the input. "
         "Blocks are a representative selection, not necessarily the first contiguous blocks in the function. "
         "Treat analyzer_skeleton as the draft to refine and graph_summary as the authoritative graph outline. "
@@ -3744,7 +4604,7 @@ std::string BuildUserPrompt(const AnalyzeRequest& request)
     prompt += "5. evidence.blocks must reference existing basic block ids.\n";
     prompt += "6. Treat blocks as representative high-signal samples, not as the only reachable blocks in order.\n";
     prompt += "7. Use instruction_window_head, instruction_window_middle, and instruction_window_tail to infer prologue, body, and late-path behavior.\n";
-    prompt += "8. Use recovered_arguments, recovered_locals, normalized_conditions, data_references, call_targets, value_merges, type_hints, idioms, callee_summaries, session_policy, observed_behavior, and pdb facts when they improve variable names, helper summaries, branch expressions, or observed behavior notes.\n";
+    prompt += "8. Use recovered_arguments, recovered_locals, call_arguments, normalized_conditions, data_references, call_targets, value_merges, type_hints, idioms, callee_summaries, session_policy, observed_behavior, and pdb facts when they improve variable names, helper summaries, branch expressions, or observed behavior notes.\n";
     prompt += "9. Prefer concrete pseudocode statements over summary comments when a memory read, write, compare, or branch is explicitly visible in the facts.\n";
     prompt += "10. If control flow is incomplete, keep visible operations explicit and mark only the missing pieces as uncertain.\n";
     prompt += "11. If truncation flags are true, preserve that uncertainty instead of over-claiming.\n";

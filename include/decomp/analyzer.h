@@ -19,5 +19,8 @@ AnalysisFacts BuildAnalysisFacts(
     const std::vector<uint8_t>& bytes,
     const std::vector<DisassembledInstruction>& rawInstructions);
 
+void RefreshDerivedAnalysisFacts(AnalysisFacts& facts);
+void ApplyRecoveredSwitchTargets(AnalysisFacts& facts);
+
 std::string ComputeSha256Hex(const std::vector<uint8_t>& bytes);
 }

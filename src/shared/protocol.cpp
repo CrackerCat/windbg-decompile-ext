@@ -103,9 +103,24 @@ JsonValue ToJson(const CallSite& call)
 JsonValue ToJson(const SwitchInfo& info)
 {
     JsonValue object = JsonValue::MakeObject();
+    JsonValue targets = JsonValue::MakeArray();
+
+    for (const auto target : info.CaseTargets)
+    {
+        targets.PushBack(JsonValue::MakeString(HexU64(target)));
+    }
+
     object.Set("site", JsonValue::MakeString(HexU64(info.Site)));
+    object.Set("table_address", JsonValue::MakeString(HexU64(info.TableAddress)));
     object.Set("case_count", JsonValue::MakeNumber(static_cast<double>(info.CaseCount)));
+    object.Set("default_target", JsonValue::MakeString(HexU64(info.DefaultTarget)));
+    object.Set("range_min", JsonValue::MakeString(HexS64(info.RangeMin)));
+    object.Set("range_max", JsonValue::MakeString(HexS64(info.RangeMax)));
+    object.Set("range_known", JsonValue::MakeBoolean(info.RangeKnown));
+    object.Set("signed_index", JsonValue::MakeBoolean(info.SignedIndex));
     object.Set("detail", JsonValue::MakeString(info.Detail));
+    object.Set("index_expression", JsonValue::MakeString(info.IndexExpression));
+    object.Set("case_targets", targets);
     return object;
 }
 
@@ -122,6 +137,25 @@ JsonValue ToJson(const MemoryAccess& access)
     object.Set("scale", JsonValue::MakeNumber(static_cast<double>(access.Scale)));
     object.Set("displacement", JsonValue::MakeString(access.Displacement));
     object.Set("rip_relative", JsonValue::MakeBoolean(access.RipRelative));
+    object.Set("implicit", JsonValue::MakeBoolean(access.Implicit));
+    object.Set("semantic", JsonValue::MakeString(access.Semantic));
+    object.Set("stack_frame_relative", JsonValue::MakeBoolean(access.StackFrameRelative));
+    object.Set("frame_base", JsonValue::MakeString(access.FrameBase));
+    object.Set("frame_offset", JsonValue::MakeString(HexS64(access.FrameOffset)));
+    object.Set("stack_pointer_delta", JsonValue::MakeString(HexS64(access.StackPointerDelta)));
+    return object;
+}
+
+JsonValue ToJson(const StackPointerFact& fact)
+{
+    JsonValue object = JsonValue::MakeObject();
+    object.Set("site", JsonValue::MakeString(HexU64(fact.Site)));
+    object.Set("delta_before", JsonValue::MakeString(HexS64(fact.DeltaBefore)));
+    object.Set("delta_after", JsonValue::MakeString(HexS64(fact.DeltaAfter)));
+    object.Set("frame_pointer_delta", JsonValue::MakeString(HexS64(fact.FramePointerDelta)));
+    object.Set("known", JsonValue::MakeBoolean(fact.Known));
+    object.Set("frame_pointer_known", JsonValue::MakeBoolean(fact.FramePointerKnown));
+    object.Set("confidence", JsonValue::MakeNumber(fact.Confidence));
     return object;
 }
 
@@ -144,6 +178,8 @@ JsonValue ToJson(const RecoveredLocal& local)
     object.Set("name", JsonValue::MakeString(local.Name));
     object.Set("base_register", JsonValue::MakeString(local.BaseRegister));
     object.Set("offset", JsonValue::MakeString(HexS64(local.Offset)));
+    object.Set("raw_base_register", JsonValue::MakeString(local.RawBaseRegister));
+    object.Set("raw_offset", JsonValue::MakeString(HexS64(local.RawOffset)));
     object.Set("storage", JsonValue::MakeString(local.Storage));
     object.Set("type_hint", JsonValue::MakeString(local.TypeHint));
     object.Set("role_hint", JsonValue::MakeString(local.RoleHint));
@@ -152,6 +188,30 @@ JsonValue ToJson(const RecoveredLocal& local)
     object.Set("read_count", JsonValue::MakeNumber(static_cast<double>(local.ReadCount)));
     object.Set("write_count", JsonValue::MakeNumber(static_cast<double>(local.WriteCount)));
     object.Set("confidence", JsonValue::MakeNumber(local.Confidence));
+    return object;
+}
+
+JsonValue ToJson(const CallArgumentFact& argument)
+{
+    JsonValue object = JsonValue::MakeObject();
+    object.Set("site", JsonValue::MakeString(HexU64(argument.Site)));
+    object.Set("ordinal", JsonValue::MakeNumber(static_cast<double>(argument.Ordinal)));
+    object.Set("location", JsonValue::MakeString(argument.Location));
+    object.Set("expression", JsonValue::MakeString(argument.Expression));
+    object.Set("type_hint", JsonValue::MakeString(argument.TypeHint));
+    object.Set("source", JsonValue::MakeString(argument.Source));
+    object.Set("confidence", JsonValue::MakeNumber(argument.Confidence));
+    return object;
+}
+
+JsonValue ToJson(const PrototypeParameter& parameter)
+{
+    JsonValue object = JsonValue::MakeObject();
+    object.Set("ordinal", JsonValue::MakeNumber(static_cast<double>(parameter.Ordinal)));
+    object.Set("name", JsonValue::MakeString(parameter.Name));
+    object.Set("type", JsonValue::MakeString(parameter.Type));
+    object.Set("location", JsonValue::MakeString(parameter.Location));
+    object.Set("confidence", JsonValue::MakeNumber(parameter.Confidence));
     return object;
 }
 
@@ -233,6 +293,11 @@ JsonValue ToJson(const ControlFlowRegion& region)
     object.Set("exit_blocks", exits);
     object.Set("condition", JsonValue::MakeString(region.Condition));
     object.Set("evidence", JsonValue::MakeString(region.Evidence));
+    object.Set("induction_variable", JsonValue::MakeString(region.InductionVariable));
+    object.Set("initial_value", JsonValue::MakeString(region.InitialValue));
+    object.Set("step", JsonValue::MakeString(region.Step));
+    object.Set("bound", JsonValue::MakeString(region.Bound));
+    object.Set("direction", JsonValue::MakeString(region.Direction));
     object.Set("confidence", JsonValue::MakeNumber(region.Confidence));
     return object;
 }
@@ -325,6 +390,13 @@ JsonValue ToJson(const IdiomPattern& idiom)
 JsonValue ToJson(const CalleeSummary& summary)
 {
     JsonValue object = JsonValue::MakeObject();
+    JsonValue parameters = JsonValue::MakeArray();
+
+    for (const auto& parameter : summary.Parameters)
+    {
+        parameters.PushBack(ToJson(parameter));
+    }
+
     object.Set("site", JsonValue::MakeString(HexU64(summary.Site)));
     object.Set("callee", JsonValue::MakeString(summary.Callee));
     object.Set("return_type", JsonValue::MakeString(summary.ReturnType));
@@ -333,6 +405,8 @@ JsonValue ToJson(const CalleeSummary& summary)
     object.Set("memory_effects", JsonValue::MakeString(summary.MemoryEffects));
     object.Set("ownership", JsonValue::MakeString(summary.Ownership));
     object.Set("source", JsonValue::MakeString(summary.Source));
+    object.Set("parameters", parameters);
+    object.Set("tail_call", JsonValue::MakeBoolean(summary.TailCall));
     object.Set("confidence", JsonValue::MakeNumber(summary.Confidence));
     return object;
 }
@@ -355,6 +429,13 @@ JsonValue ToJson(const DataReference& reference)
 JsonValue ToJson(const CallTargetInfo& call)
 {
     JsonValue object = JsonValue::MakeObject();
+    JsonValue parameters = JsonValue::MakeArray();
+
+    for (const auto& parameter : call.Parameters)
+    {
+        parameters.PushBack(ToJson(parameter));
+    }
+
     object.Set("site", JsonValue::MakeString(HexU64(call.Site)));
     object.Set("target_address", JsonValue::MakeString(HexU64(call.TargetAddress)));
     object.Set("display_name", JsonValue::MakeString(call.DisplayName));
@@ -363,7 +444,14 @@ JsonValue ToJson(const CallTargetInfo& call)
     object.Set("prototype", JsonValue::MakeString(call.Prototype));
     object.Set("return_type", JsonValue::MakeString(call.ReturnType));
     object.Set("side_effects", JsonValue::MakeString(call.SideEffects));
+    object.Set("memory_effects", JsonValue::MakeString(call.MemoryEffects));
+    object.Set("ownership", JsonValue::MakeString(call.Ownership));
+    object.Set("target_expression", JsonValue::MakeString(call.TargetExpression));
+    object.Set("vtable_offset", JsonValue::MakeNumber(static_cast<double>(call.VtableOffset)));
     object.Set("indirect", JsonValue::MakeBoolean(call.Indirect));
+    object.Set("tail_call", JsonValue::MakeBoolean(call.TailCall));
+    object.Set("virtual_call", JsonValue::MakeBoolean(call.VirtualCall));
+    object.Set("parameters", parameters);
     object.Set("confidence", JsonValue::MakeNumber(call.Confidence));
     return object;
 }
@@ -433,12 +521,18 @@ JsonValue ToJson(const PdbSourceLocation& source)
 JsonValue ToJson(const PdbFacts& pdb)
 {
     JsonValue object = JsonValue::MakeObject();
+    JsonValue prototypeParameters = JsonValue::MakeArray();
     JsonValue params = JsonValue::MakeArray();
     JsonValue locals = JsonValue::MakeArray();
     JsonValue fieldHints = JsonValue::MakeArray();
     JsonValue enumHints = JsonValue::MakeArray();
     JsonValue sourceLocations = JsonValue::MakeArray();
     JsonValue conflicts = JsonValue::MakeArray();
+
+    for (const auto& parameter : pdb.PrototypeParameters)
+    {
+        prototypeParameters.PushBack(ToJson(parameter));
+    }
 
     for (const auto& param : pdb.Params)
     {
@@ -476,6 +570,7 @@ JsonValue ToJson(const PdbFacts& pdb)
     object.Set("function_name", JsonValue::MakeString(pdb.FunctionName));
     object.Set("prototype", JsonValue::MakeString(pdb.Prototype));
     object.Set("return_type", JsonValue::MakeString(pdb.ReturnType));
+    object.Set("prototype_parameters", prototypeParameters);
     object.Set("params", params);
     object.Set("locals", locals);
     object.Set("field_hints", fieldHints);
@@ -855,6 +950,8 @@ bool ParseRecoveredLocal(const JsonValue& object, RecoveredLocal& local)
     TryGetString(object, "name", local.Name);
     TryGetString(object, "base_register", local.BaseRegister);
     TryGetS64(object, "offset", local.Offset);
+    TryGetString(object, "raw_base_register", local.RawBaseRegister);
+    TryGetS64(object, "raw_offset", local.RawOffset);
     TryGetString(object, "storage", local.Storage);
     TryGetString(object, "type_hint", local.TypeHint);
     TryGetString(object, "role_hint", local.RoleHint);
@@ -863,6 +960,40 @@ bool ParseRecoveredLocal(const JsonValue& object, RecoveredLocal& local)
     TryGetU32(object, "read_count", local.ReadCount);
     TryGetU32(object, "write_count", local.WriteCount);
     TryGetDouble(object, "confidence", local.Confidence);
+    return true;
+}
+
+bool ParseStackPointerFact(const JsonValue& object, StackPointerFact& fact)
+{
+    TryGetU64(object, "site", fact.Site);
+    TryGetS64(object, "delta_before", fact.DeltaBefore);
+    TryGetS64(object, "delta_after", fact.DeltaAfter);
+    TryGetS64(object, "frame_pointer_delta", fact.FramePointerDelta);
+    TryGetBool(object, "known", fact.Known);
+    TryGetBool(object, "frame_pointer_known", fact.FramePointerKnown);
+    TryGetDouble(object, "confidence", fact.Confidence);
+    return true;
+}
+
+bool ParseCallArgumentFact(const JsonValue& object, CallArgumentFact& argument)
+{
+    TryGetU64(object, "site", argument.Site);
+    TryGetU32(object, "ordinal", argument.Ordinal);
+    TryGetString(object, "location", argument.Location);
+    TryGetString(object, "expression", argument.Expression);
+    TryGetString(object, "type_hint", argument.TypeHint);
+    TryGetString(object, "source", argument.Source);
+    TryGetDouble(object, "confidence", argument.Confidence);
+    return true;
+}
+
+bool ParsePrototypeParameter(const JsonValue& object, PrototypeParameter& parameter)
+{
+    TryGetU32(object, "ordinal", parameter.Ordinal);
+    TryGetString(object, "name", parameter.Name);
+    TryGetString(object, "type", parameter.Type);
+    TryGetString(object, "location", parameter.Location);
+    TryGetDouble(object, "confidence", parameter.Confidence);
     return true;
 }
 
@@ -919,6 +1050,28 @@ void ParseStringArrayMember(const JsonValue& object, const std::string& key, std
     }
 }
 
+void ParsePrototypeParameterArrayMember(const JsonValue& object, const std::string& key, std::vector<PrototypeParameter>& values)
+{
+    const JsonValue* array = object.Find(key);
+
+    if (array == nullptr || !array->IsArray())
+    {
+        return;
+    }
+
+    for (const auto& item : array->GetArray())
+    {
+        if (!item.IsObject())
+        {
+            continue;
+        }
+
+        PrototypeParameter parameter;
+        ParsePrototypeParameter(item, parameter);
+        values.push_back(std::move(parameter));
+    }
+}
+
 bool ParseIrValue(const JsonValue& object, IrValue& value)
 {
     TryGetString(object, "id", value.Id);
@@ -942,6 +1095,11 @@ bool ParseControlFlowRegion(const JsonValue& object, ControlFlowRegion& region)
     TryGetString(object, "header_block", region.HeaderBlock);
     TryGetString(object, "condition", region.Condition);
     TryGetString(object, "evidence", region.Evidence);
+    TryGetString(object, "induction_variable", region.InductionVariable);
+    TryGetString(object, "initial_value", region.InitialValue);
+    TryGetString(object, "step", region.Step);
+    TryGetString(object, "bound", region.Bound);
+    TryGetString(object, "direction", region.Direction);
     TryGetDouble(object, "confidence", region.Confidence);
     ParseStringArrayMember(object, "body_blocks", region.BodyBlocks);
     ParseStringArrayMember(object, "latch_blocks", region.LatchBlocks);
@@ -1004,7 +1162,9 @@ bool ParseCalleeSummary(const JsonValue& object, CalleeSummary& summary)
     TryGetString(object, "memory_effects", summary.MemoryEffects);
     TryGetString(object, "ownership", summary.Ownership);
     TryGetString(object, "source", summary.Source);
+    TryGetBool(object, "tail_call", summary.TailCall);
     TryGetDouble(object, "confidence", summary.Confidence);
+    ParsePrototypeParameterArrayMember(object, "parameters", summary.Parameters);
     return true;
 }
 
@@ -1032,8 +1192,15 @@ bool ParseCallTargetInfo(const JsonValue& object, CallTargetInfo& call)
     TryGetString(object, "prototype", call.Prototype);
     TryGetString(object, "return_type", call.ReturnType);
     TryGetString(object, "side_effects", call.SideEffects);
+    TryGetString(object, "memory_effects", call.MemoryEffects);
+    TryGetString(object, "ownership", call.Ownership);
+    TryGetString(object, "target_expression", call.TargetExpression);
+    TryGetU32(object, "vtable_offset", call.VtableOffset);
     TryGetBool(object, "indirect", call.Indirect);
+    TryGetBool(object, "tail_call", call.TailCall);
+    TryGetBool(object, "virtual_call", call.VirtualCall);
     TryGetDouble(object, "confidence", call.Confidence);
+    ParsePrototypeParameterArrayMember(object, "parameters", call.Parameters);
     return true;
 }
 
@@ -1103,6 +1270,7 @@ bool ParsePdbFacts(const JsonValue& object, PdbFacts& pdb)
     TryGetString(object, "prototype", pdb.Prototype);
     TryGetString(object, "return_type", pdb.ReturnType);
     TryGetDouble(object, "confidence", pdb.Confidence);
+    ParsePrototypeParameterArrayMember(object, "prototype_parameters", pdb.PrototypeParameters);
 
     const JsonValue* params = object.Find("params");
 
@@ -1288,9 +1456,11 @@ JsonValue ToJson(const AnalyzeRequest& request)
     JsonValue calls = JsonValue::MakeArray();
     JsonValue indirectCalls = JsonValue::MakeArray();
     JsonValue switches = JsonValue::MakeArray();
+    JsonValue stackPointer = JsonValue::MakeArray();
     JsonValue memoryAccesses = JsonValue::MakeArray();
     JsonValue recoveredArguments = JsonValue::MakeArray();
     JsonValue recoveredLocals = JsonValue::MakeArray();
+    JsonValue callArguments = JsonValue::MakeArray();
     JsonValue valueMerges = JsonValue::MakeArray();
     JsonValue irValues = JsonValue::MakeArray();
     JsonValue controlFlow = JsonValue::MakeArray();
@@ -1333,6 +1503,11 @@ JsonValue ToJson(const AnalyzeRequest& request)
         switches.PushBack(ToJson(info));
     }
 
+    for (const auto& fact : request.Facts.StackPointer)
+    {
+        stackPointer.PushBack(ToJson(fact));
+    }
+
     for (const auto& access : request.Facts.MemoryAccesses)
     {
         memoryAccesses.PushBack(ToJson(access));
@@ -1346,6 +1521,11 @@ JsonValue ToJson(const AnalyzeRequest& request)
     for (const auto& local : request.Facts.RecoveredLocals)
     {
         recoveredLocals.PushBack(ToJson(local));
+    }
+
+    for (const auto& argument : request.Facts.CallArguments)
+    {
+        callArguments.PushBack(ToJson(argument));
     }
 
     for (const auto& merge : request.Facts.ValueMerges)
@@ -1424,9 +1604,11 @@ JsonValue ToJson(const AnalyzeRequest& request)
     object.Set("calls", calls);
     object.Set("indirect_calls", indirectCalls);
     object.Set("switches", switches);
+    object.Set("stack_pointer", stackPointer);
     object.Set("memory_accesses", memoryAccesses);
     object.Set("recovered_arguments", recoveredArguments);
     object.Set("recovered_locals", recoveredLocals);
+    object.Set("call_arguments", callArguments);
     object.Set("value_merges", valueMerges);
     object.Set("ir_values", irValues);
     object.Set("control_flow", controlFlow);
@@ -1728,9 +1910,53 @@ bool ParseAnalyzeRequest(const std::string& text, AnalyzeRequest& request, std::
 
             SwitchInfo info;
             TryGetU64(item, "site", info.Site);
+            TryGetU64(item, "table_address", info.TableAddress);
             TryGetU32(item, "case_count", info.CaseCount);
+            TryGetU64(item, "default_target", info.DefaultTarget);
+            TryGetS64(item, "range_min", info.RangeMin);
+            TryGetS64(item, "range_max", info.RangeMax);
+            TryGetBool(item, "range_known", info.RangeKnown);
+            TryGetBool(item, "signed_index", info.SignedIndex);
             TryGetString(item, "detail", info.Detail);
+            TryGetString(item, "index_expression", info.IndexExpression);
+
+            const JsonValue* caseTargets = item.Find("case_targets");
+
+            if (caseTargets != nullptr && caseTargets->IsArray())
+            {
+                for (const auto& target : caseTargets->GetArray())
+                {
+                    uint64_t address = 0;
+
+                    if (target.IsString() && TryParseUnsigned(target.GetString(), address))
+                    {
+                        info.CaseTargets.push_back(address);
+                    }
+                    else if (target.IsNumber())
+                    {
+                        info.CaseTargets.push_back(static_cast<uint64_t>(target.GetNumber()));
+                    }
+                }
+            }
+
             request.Facts.Switches.push_back(info);
+        }
+    }
+
+    const JsonValue* stackPointer = object.Find("stack_pointer");
+
+    if (stackPointer != nullptr && stackPointer->IsArray())
+    {
+        for (const auto& item : stackPointer->GetArray())
+        {
+            if (!item.IsObject())
+            {
+                continue;
+            }
+
+            StackPointerFact fact;
+            ParseStackPointerFact(item, fact);
+            request.Facts.StackPointer.push_back(fact);
         }
     }
 
@@ -1756,6 +1982,12 @@ bool ParseAnalyzeRequest(const std::string& text, AnalyzeRequest& request, std::
             TryGetU32(item, "scale", access.Scale);
             TryGetString(item, "displacement", access.Displacement);
             TryGetBool(item, "rip_relative", access.RipRelative);
+            TryGetBool(item, "implicit", access.Implicit);
+            TryGetString(item, "semantic", access.Semantic);
+            TryGetBool(item, "stack_frame_relative", access.StackFrameRelative);
+            TryGetString(item, "frame_base", access.FrameBase);
+            TryGetS64(item, "frame_offset", access.FrameOffset);
+            TryGetS64(item, "stack_pointer_delta", access.StackPointerDelta);
             request.Facts.MemoryAccesses.push_back(access);
         }
     }
@@ -1791,6 +2023,23 @@ bool ParseAnalyzeRequest(const std::string& text, AnalyzeRequest& request, std::
             RecoveredLocal local;
             ParseRecoveredLocal(item, local);
             request.Facts.RecoveredLocals.push_back(local);
+        }
+    }
+
+    const JsonValue* callArguments = object.Find("call_arguments");
+
+    if (callArguments != nullptr && callArguments->IsArray())
+    {
+        for (const auto& item : callArguments->GetArray())
+        {
+            if (!item.IsObject())
+            {
+                continue;
+            }
+
+            CallArgumentFact argument;
+            ParseCallArgumentFact(item, argument);
+            request.Facts.CallArguments.push_back(argument);
         }
     }
 

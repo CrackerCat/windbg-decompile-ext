@@ -19,11 +19,15 @@
 - 메모리 접근, call site, switch 후보 수집
 - 인자/로컬/merge/조건식의 휴리스틱 복구
 - SSA-like IR value facts, def-use hints, copy/constant canonicalization, dead-definition hints
-- dominator 기반 control-flow region 후보(natural loop, if/else, switch)
-- x64 ABI facts(shadow/home slot, prolog/epilog, no-return, tail-call, thunk/import-wrapper 후보)
+- dominator 기반 control-flow region 후보(natural loop, if/else, switch), loop induction, switch range/default metadata
+- x64 ABI facts(shadow/home slot, stack pointer delta, prolog/epilog, no-return, tail-call, thunk/import-wrapper 후보, register/stack call argument)
+- SIMD/FP ABI 인자 복구와 vector zero-idiom false-positive 억제
+- indirect/virtual call target 후보와 vtable offset metadata
 - PDB 기반 함수/파라미터/로컬/필드/enum/source 힌트
 - LLM 단일 패스 + chunked multi-pass 분석
-- loop/switch/no-return evidence를 포함한 verifier 기반 후처리 검증
+- ranked fact selection과 spread sampling 기반 prompt 압축
+- loop/switch/no-return/call-argument/evidence grounding을 포함한 verifier 기반 후처리 검증
+- analyzer/protocol/verifier snapshot 회귀 테스트
 
 현재 강점은 "LLM에게 아무것도 맡기지 않고, 가능한 많은 구조화된 사실을 먼저 만든다"는 점이다.
 P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 본격적인 디컴파일러 수준으로 올라갈 여지가 크다.
@@ -56,15 +60,17 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 상태:
 
 - 2026-04-25 기준 P0 초기 구현 완료
+- 2026-05-03 기준 P0 품질 고도화 반영
 - 새 analyzer facts: `ir_values`, `control_flow`, `abi`
+- 추가 analyzer facts: `stack_pointer`, `call_arguments`, structured `prototype_parameters`
 - 새 no-return override: `DECOMP_NORETURN_OVERRIDES`
-- 새 verifier check: loop/switch/no-return claim과 analyzer evidence 대조
+- 새 verifier check: loop/switch/no-return/call argument/evidence grounding claim과 analyzer evidence 대조
 - README 반영 완료
 
 남은 방향:
 
 - 현재 구현은 "구조화된 evidence를 안정적으로 만들고 LLM/verifier에 전달하는 1차 기반"이다.
-- 다음 단계는 더 강한 alias/type propagation, post-dominator 기반 region tree, unwind metadata 심화 해석, regression snapshot 테스트다.
+- 다음 단계는 더 강한 alias/type propagation, post-dominator 기반 region tree, unwind metadata 심화 해석, 더 넓은 실제 바이너리 corpus 회귀 테스트다.
 
 #### 1) 내부 IR/SSA 계층 도입
 
@@ -80,6 +86,8 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - SSA-like rename 도입
 - constant/copy propagation
 - stack slot alias 정리
+- CFG-sensitive stack pointer dataflow와 frame-relative alias 기록
+- call site register/stack argument fact 복구
 - temporary value canonicalization
 - `/json` 및 LLM prompt에 `ir_values` 전달
 
@@ -88,7 +96,7 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - block 간 reaching definition 전파
 - memory alias와 stack-slot overlap 처리
 - phi/merge 표현을 `value_merges`와 더 강하게 연결
-- use-before-def / dead-store verifier rule 추가
+- dead-store verifier rule 추가
 
 기대 효과:
 
@@ -106,15 +114,17 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 구현됨:
 
 - dominator 기반 natural loop 후보 식별
+- loop induction variable, initial value, step, bound, direction metadata 복구
 - 조건 block 기반 if/else 후보 식별
 - 기존 switch 후보를 control-flow region으로 승격
+- switch table address, case targets, default target, range, signedness, index expression metadata 복구
 - 구조 복구 실패 시 uncertainty 기록
 - `/json` 및 LLM prompt에 `control_flow` 전달
 
 남은 고도화:
 
 - post-dominator 계산
-- switch table / jump table case target 정밀 복구
+- switch table / jump table case target 복구 corpus 확대
 - semantics-preserving structuring 도입
 - iterative refinement 또는 fallback structuring 설계
 - loop body 전체 closure와 exit/latch 정밀화
@@ -138,6 +148,8 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - prolog/epilog legal pattern 기반 프레임 인식 강화
 - non-return 함수 탐지 및 수동 override 지원
 - tail-call / thunk / import wrapper 분류
+- SIMD/FP ABI register(`xmm0`-`xmm3`) 인자 복구
+- vector zero-idiom을 incoming argument로 오판하지 않는 guard 추가
 - `/json` 및 LLM prompt에 `abi` 전달
 - fallback disassembly와 analyzer no-return 판단에 `DECOMP_NORETURN_OVERRIDES` 반영
 
@@ -146,7 +158,7 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - 실제 unwind metadata opcode 해석 심화
 - epilog legal pattern 정밀화
 - import wrapper와 일반 tail-call 구분 정확도 개선
-- no-return override를 환경변수 외 WinDbg 명령으로 확장
+- varargs, aggregate, vector return convention 추가 검증
 
 기대 효과:
 
@@ -158,9 +170,12 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 상태:
 
 - 2026-04-25 기준 P1 초기 구현 완료
+- 2026-05-03 기준 P1 call/API semantics 고도화 반영
 - 새 analyzer facts: `type_hints`, `idioms`, `callee_summaries`
 - PDB scoped params/locals, field hints, enum hints를 통합 type hint stream으로 승격
 - symbol/type-enriched call target이 초기 callee summary를 대체하도록 연결
+- indirect/virtual call target, vtable offset, target expression metadata 추가
+- Win32/NT/Rtl memory/allocation/release/status API summary 추가
 - README 반영 완료
 
 남은 방향:
@@ -181,6 +196,7 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - class/vtable/RTTI 후보 수집
 - 함수 시그니처 추정 결과의 confidence 구분
 - PDB scoped params/locals/fields/enums를 `type_hints`로 승격
+- PDB prototype parameter를 ordinal/type/name/ABI location/source confidence로 구조화
 - `/json` 및 LLM prompt에 `type_hints` 전달
 
 남은 고도화:
@@ -209,6 +225,7 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - import / IAT / thunk / stub labeling 강화
 - 표준 라이브러리 및 흔한 helper signature 데이터 축적
 - symbol-resolved call target 기반 idiom 보강
+- Win32/NT/Rtl memory copy/fill/zero, allocation/release, status/error semantic 모델 추가
 - `/json` 및 LLM prompt에 `idioms` 전달
 
 남은 고도화:
@@ -234,6 +251,7 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - known helper side-effect table
 - import/API 이름 기반 semantic summary
 - WinDbg symbol/type-enriched `CallTargetInfo`로 return type, parameter model, side effect, memory effect, ownership 갱신
+- register/memory indirect call과 virtual-call/vtable 후보를 `CallTargetInfo`로 직렬화
 - `/json` 및 LLM prompt에 `callee_summaries` 전달
 
 남은 고도화:
@@ -253,9 +271,12 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 상태:
 
 - 2026-04-25 기준 P2 초기 구현 완료
+- 2026-05-03 기준 P2 prompt/verifier 고도화 반영
 - 새 prompt facts: `analyzer_skeleton`, `graph_summary`
 - single-pass/chunk/merge prompt가 refine-first와 graph-aware 정책을 명시
 - verifier가 branch/return/evidence coverage/suspicious identifier claim까지 추가 점검
+- ranked high-signal fact selection과 spread sampling으로 대형 함수 prompt 대표성 개선
+- switch metadata, recovered call target, call argument arity, response name grounding 검증 추가
 - README 반영 완료
 
 #### 7) refine-first 전략으로 전환
@@ -270,13 +291,14 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - skeleton + evidence + uncertainty 기반 refinement prompt 도입
 - mock/no-LLM path도 analyzer skeleton을 사용하도록 개선
 - single-pass와 merge prompt에 skeleton refinement 규칙 추가
+- fact selection strategy metadata를 prompt facts에 포함
 
 남은 고도화:
 
 - 명시적인 `/refine` 모드 분리
 - single-pass / chunked / refinement 모드의 사용자 노출 정책 정리
 - 후보 다중 생성 후 verifier 점수 선택
-- verifier feedback 기반 자동 재시도/refine loop
+- verifier feedback 기반 다중 refine loop
 
 기대 효과:
 
@@ -295,13 +317,14 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - representative high-signal block 요약을 graph-aware prompt에 포함
 - truncated input에 대한 명시적 불확실성 정책 강화
 - single-pass/chunk/merge prompt에서 unsupported loop/switch/branch 생성 금지
+- high-signal fact ranking과 spread sampling으로 큰 fact set의 대표성 유지
 
 남은 고도화:
 
 - block tree / loop tree / region tree 설계
-- block importance ranking 정량화
+- block importance ranking 정량화 추가 검증
 - evidence coverage 기반 merge 단계 자동 보정
-- graph summary snapshot 회귀 테스트
+- 실제 최적화 바이너리 기반 graph summary snapshot 확대
 
 기대 효과:
 
@@ -323,6 +346,11 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - no-return claim vs ABI no-return evidence 검사
 - call/return behavior sanity 검사
 - callee summary와 pseudo call effect 일관성 검사
+- recovered call argument arity와 pseudo call argument 수 대조
+- switch table/default/range metadata 누락 검사
+- recovered indirect/virtual call target 누락 검사
+- response function/name grounding 검사
+- comment-aware pseudo token 기반 unsupported identifier false-positive 완화
 - confidence scoring 세분화
 - high-confidence response의 missing evidence 점검
 - suspicious identifier/use-before-def 스타일 경고
@@ -331,7 +359,7 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 
 남은 고도화:
 
-- verifier issue code별 snapshot 테스트 추가
+- verifier issue code별 snapshot corpus 확대
 - retry/refine 후보 다중 생성과 verifier 점수 기반 선택
 - observed runtime evidence와 verifier rule 연결
 
@@ -637,6 +665,8 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - `type_hints`, `idioms`, `callee_summaries` snapshot
 - `analyzer_skeleton`, `graph_summary` snapshot
 - verifier score snapshot
+- recovered call arguments, SIMD/FP ABI, switch metadata, virtual-call metadata snapshot
+- prompt fact ranking/spread sampling snapshot
 - prompt truncation 동작 검증
 - chunk merge consistency 검증
 
@@ -675,12 +705,11 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 
 즉시 시작할 작업은 아래 순서를 권장한다.
 
-1. P0 analyzer facts JSON snapshot 테스트 추가
-2. P1 semantic facts JSON snapshot 테스트 추가
-3. P2 prompt/verifier snapshot 테스트 추가
-4. post-dominator / region tree 기반 structuring 고도화
-5. unwind metadata opcode 해석과 epilog pattern 정밀화
-6. 실제 TTD call table 질의 실행 및 인수/반환값 샘플링
-7. IDebugHost data model provider와 JavaScript bridge 검토
+1. post-dominator / region tree 기반 structuring 고도화
+2. unwind metadata opcode 해석과 epilog pattern 정밀화
+3. 실제 최적화 바이너리 corpus로 snapshot 테스트 확대
+4. persistent direct callee summary cache 설계
+5. 실제 TTD call table 질의 실행 및 인수/반환값 샘플링
+6. IDebugHost data model provider와 JavaScript bridge 검토
 
 이 순서가 가장 적은 리스크로 가장 큰 품질 향상을 기대할 수 있다.

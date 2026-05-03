@@ -20,12 +20,13 @@ This project is a Windows x64 WinDbg extension skeleton that resolves a function
 - symbol-region, unwind, and heuristic function-range recovery
 - SSA-lite style recovery for incoming register arguments, stack-slot locals, merge candidates, and normalized branch conditions
 - low-level IR value facts with def-use hints, canonicalized copy/constant expressions, and dead-definition markers
-- dominator-backed control-flow region facts for natural loops, if/else candidates, and switch candidates
-- x64 ABI facts for shadow/home slots, prolog/epilog recognition, no-return calls, tail calls, thunks, and import-wrapper candidates
+- dominator-backed control-flow region facts for natural loops, if/else candidates, switch candidates, loop induction metadata, and switch range/default metadata
+- x64 ABI facts for shadow/home slots, stack pointer deltas, prolog/epilog recognition, no-return calls, tail calls, thunks, import-wrapper candidates, and recovered register/stack call arguments
+- SIMD/FP-aware Microsoft x64 argument recovery for `xmm0` through `xmm3`, with vector zero-idiom guards to avoid false incoming arguments
 - type recovery hints for pointer-like values, stack locals, field offsets, scaled-index arrays, enum-like compares, bitflag tests, and vtable candidates
 - idiom and library-pattern facts for memory/string helpers, security cookies, stack probes, allocators, aggregate initializers, and RIP-relative global/import loads
-- callee semantic summaries with return type, parameter model, side effects, memory effects, ownership hints, and confidence
-- refine-first prompting with an analyzer-generated pseudocode skeleton and graph-aware summaries for CFG regions, conditions, and important blocks
+- call-target facts for direct calls, register/memory indirect calls, virtual-call/vtable-offset candidates, return type, parameter model, side effects, memory effects, ownership hints, and confidence
+- refine-first prompting with an analyzer-generated pseudocode skeleton, graph-aware summaries for CFG regions, conditions, and important blocks, ranked high-signal fact selection, and spread sampling for large fact sets
 - WinDbg DML links for entry/basic-block/evidence/call-target navigation when the output callback supports DML
 - separated result modes for brief, evidence explanation, facts-only, debug prompt, JSON, and data-model style output
 - user correction switches for no-return, type, field, and rename hints
@@ -191,6 +192,17 @@ Recommended investigation workflow:
 5. Add focused corrections such as `/fix:noreturn:`, `/fix:type:`, `/fix:field:`, or `/fix:rename:` and re-run the same target.
 6. Capture `/view:json` or `/last:json` when filing bugs or comparing behavior across builds.
 
+## Analyzer Fact Surface
+
+Recent analyzer facts are intentionally carried through `/view:json`, `/view:facts`, `/view:prompt`, and normal LLM mode. High-value fields to inspect first:
+
+- `stack_pointer` records per-instruction stack deltas, frame-relative aliases, and confidence.
+- `call_arguments` records recovered register and stack arguments at call sites, including nearby cross-block stack stores when evidence is strong enough.
+- `pdb.prototype_parameters` records structured prototype parameter names, types, ordinals, ABI locations, and source confidence.
+- `control_flow` includes loop induction variables, initial values, steps, bounds, direction, switch table address, case targets, default target, range bounds, signedness, and index expression when recovered.
+- `callee_summaries` and call-target facts include direct, indirect, and virtual-call/vtable candidates plus known Win32/NT/Rtl memory, allocation, release, and status semantics.
+- Prompt fact selection ranks high-signal entries first, then preserves distribution with spread sampling so large functions do not lose all low-frequency evidence.
+
 ## Recommended dbgeng Setup
 
 Fastest path is to vendor the header and import library into the project.
@@ -262,6 +274,17 @@ The built `decomp.dll` now embeds a Windows file version taken from `version.txt
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\Build.ps1 -Reconfigure
 ```
+
+### Regression tests
+
+```powershell
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+`decomp_snapshot_tests` covers the analyzer/protocol/verifier contracts for recovered stack arguments, SIMD/FP ABI inputs, vector zero-idiom suppression, loop induction preference, switch metadata, virtual-call metadata, known API summaries, prompt fact selection, and verifier grounding checks.
 
 ### Legacy dbgeng build
 
@@ -631,15 +654,17 @@ Example `/view:json` response details:
 - Analyzer facts now include P0 quality fields:
   `ir_values`, `control_flow`, and `abi`.
 - `ir_values` exposes SSA-like value ids, definition sites, targets, canonical expressions, use links, constant/copy flags, and dead-definition hints.
-- `control_flow` exposes structured region candidates such as `natural_loop`, `if_else_candidate`, and `switch_candidate` with block evidence and confidence.
-- `abi` exposes Microsoft x64 shadow-space assumptions, home-slot evidence, frame/prolog/epilog recognition, no-return call evidence, tail-call candidates, thunk candidates, and import-wrapper candidates.
+- `stack_pointer` exposes per-instruction stack deltas, frame-relative aliases, raw base/offsets, and confidence.
+- `control_flow` exposes structured region candidates such as `natural_loop`, `if_else_candidate`, and `switch_candidate` with block evidence, loop induction metadata, switch table/default/range metadata, signedness, index expressions, and confidence.
+- `abi` exposes Microsoft x64 shadow-space assumptions, home-slot evidence, frame/prolog/epilog recognition, no-return call evidence, tail-call candidates, thunk candidates, import-wrapper candidates, and recovered call arguments from registers and stack stores.
 - Analyzer facts now also include P1 semantic fields:
   `type_hints`, `idioms`, and `callee_summaries`.
 - `type_hints` exposes pointer, local, field-offset, array-like, enum-like, bitflag-like, and vtable-candidate evidence with source and confidence. When PDB data is available, scoped params/locals, field hints, and enum constants are also promoted into this unified type-hint stream.
 - `idioms` exposes higher-level replacements for recognized helper calls and compiler patterns such as memory copy/fill, string copy, security cookie checks, stack probes, allocation/free helpers, aggregate initializers, and RIP-relative global/import loads.
-- `callee_summaries` exposes direct callee return-type, parameter-model, side-effect, memory-effect, ownership, source, and confidence hints; symbol/type-enriched call targets replace the initial heuristic summaries when WinDbg can resolve them.
+- `callee_summaries` exposes direct and indirect callee return-type, parameter-model, side-effect, memory-effect, ownership, source, and confidence hints; symbol/type-enriched call targets replace the initial heuristic summaries when WinDbg can resolve them, and virtual-call candidates include target expressions plus vtable offsets when recovered.
+- Known Win32/NT/Rtl API summaries describe memory copy/fill/zero, allocation, release, status, and error behavior when symbol names are available.
 - Prompt facts include `analyzer_skeleton` and `graph_summary` so the model refines an evidence-backed draft instead of starting from a blank page.
-- `graph_summary` provides entry block, control-flow regions, normalized conditions, and representative high-signal blocks with an explicit truncation policy.
+- `graph_summary` provides entry block, control-flow regions, normalized conditions, and representative high-signal blocks with an explicit truncation policy. Prompt fact selection now ranks high-signal entries and uses spread sampling to keep large fact sets representative.
 - The verifier response includes legacy `warnings` plus structured `issues` entries. Each issue carries `severity`, `code`, `message`, and optional `evidence` so tools can filter errors such as `branch.true_target_not_successor` separately from lower-risk warnings.
 - Verifier checks now compare normalized branch true/false targets against CFG successors, compare pseudo-code branch density against recovered conditional branches, and cross-check direct callee summaries against pseudo-code call effects.
 - In LLM mode, the extension automatically feeds verifier issues back into one retry prompt. The retry is kept when it preserves or improves verifier quality; otherwise the original response is retained with an added uncertainty note.
