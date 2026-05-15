@@ -407,7 +407,7 @@ Place `decomp.llm.json` beside `decomp.dll`.
 
 This file is not only for network LLM settings.
 
-- `endpoint`, `model`, token budgets, and chunking settings affect the LLM path.
+- `provider`, `endpoint`, `model`, token budgets, and chunking settings affect the LLM path.
 - `display_language` affects the natural language used in summaries and uncertainties.
 - `syntax_highlighting` affects pseudo-code rendering in WinDbg when DML-aware output is available.
 - `display_language` and `syntax_highlighting` are still used for `/view:analyzer` and mock-provider output.
@@ -416,6 +416,7 @@ Example:
 
 ```json
 {
+  "provider": "openai-compatible",
   "endpoint": "https://api.openai.com/v1/chat/completions",
   "model": "gpt-5.4-2026-03-05",
   "api_key_env": "OPENAI_API_KEY",
@@ -448,12 +449,34 @@ Example:
 }
 ```
 
+ChatGPT subscription example:
+
+```json
+{
+  "provider": "chatgpt",
+  "model": "gpt-5.5",
+  "chatgpt_auth_file": "%USERPROFILE%\\.codex\\auth.json",
+  "timeout_ms": 120000,
+  "max_completion_tokens": 4000,
+  "chunk_completion_tokens": 3500,
+  "merge_completion_tokens": 9000,
+  "reasoning_effort": "medium"
+}
+```
+
+For `provider: "chatgpt"`, `endpoint` is optional and defaults to `https://chatgpt.com/backend-api/codex/responses`. A base URL such as `https://chatgpt.com/backend-api/codex` is also accepted and normalized to `/responses`. The extension reads `tokens.access_token` and `tokens.refresh_token` from the configured auth file, refreshes expired JWT access tokens through OpenAI OAuth, and writes the refreshed token set back to that file. The default auth file is `%USERPROFILE%\.codex\auth.json`, so a Codex CLI ChatGPT login can be reused directly. The extension does not launch a browser or start an OAuth login flow from inside WinDbg; if the auth file is missing, invalid, or no longer refreshable, run `codex login` outside WinDbg and retry `!decomp`. For one-off tests, use `access_token` or `access_token_env` instead of an auth file. `api_key`, `api_key_env`, `DECOMP_LLM_API_KEY`, and `OPENAI_API_KEY` are reserved for OpenAI-compatible API-key providers and are ignored by the ChatGPT provider.
+
 Supported keys:
 
+- `provider`
 - `endpoint`
 - `model`
 - `api_key`
 - `api_key_env`
+- `access_token`
+- `access_token_env`
+- `chatgpt_auth_file`
+- `reasoning_effort`
 - `timeout_ms`
 - `max_completion_tokens`
 - `force_chunked`
@@ -675,10 +698,18 @@ Example `/view:json` response details:
 
 Optional environment overrides:
 
+- `DECOMP_LLM_PROVIDER`
 - `DECOMP_LLM_ENDPOINT`
 - `DECOMP_LLM_MODEL`
 - `DECOMP_LLM_API_KEY`
 - `OPENAI_API_KEY`
+- `DECOMP_LLM_CHATGPT_ACCESS_TOKEN`
+- `DECOMP_LLM_CODEX_ACCESS_TOKEN`
+- `KERNFORGE_CODEX_ACCESS_TOKEN`
+- `DECOMP_LLM_CHATGPT_AUTH_FILE`
+- `DECOMP_LLM_CODEX_AUTH_FILE`
+- `KERNFORGE_CODEX_AUTH_FILE`
+- `DECOMP_LLM_REASONING_EFFORT`
 - `DECOMP_LLM_TIMEOUT_MS`
 - `DECOMP_LLM_MAX_COMPLETION_TOKENS`
 - `DECOMP_LLM_FORCE_CHUNKED`
@@ -734,6 +765,17 @@ Expected checks:
 - `/view:json` output should include `preferred_natural_language_tag` and `preferred_natural_language_name` in the serialized request
 - when private or rich PDBs are loaded, `/view:json` should also include `pdb.prototype`, `pdb.params`, and possibly `pdb.locals`
 - for typed structs and enums, `/view:json` may include `pdb.field_hints` and `pdb.enum_hints`
+
+## ChatGPT Subscription Example
+
+```powershell
+$env:DECOMP_LLM_PROVIDER = "chatgpt"
+$env:DECOMP_LLM_MODEL = "gpt-5.5"
+$env:DECOMP_LLM_CHATGPT_AUTH_FILE = "$env:USERPROFILE\.codex\auth.json"
+$env:DECOMP_LLM_TIMEOUT_MS = "120000"
+```
+
+If the auth file contains a refresh token, the extension refreshes an expired access token before sending the request. `DECOMP_LLM_CHATGPT_ACCESS_TOKEN` can be used for a temporary bearer token, but the auth-file path is better for normal WinDbg sessions because it survives token expiry. The extension never opens a browser during `!decomp`; run `codex login` outside WinDbg when an interactive ChatGPT login is needed.
 
 ## Local LLM Endpoint Examples
 

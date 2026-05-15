@@ -32,9 +32,12 @@ struct DisplayLanguageConfig
 
 struct LlmClientConfig
 {
+    std::string Provider = "openai-compatible";
     std::string Endpoint;
     std::string Model = "local-model";
     std::string ApiKey;
+    std::string ChatGptAuthFile;
+    std::string ReasoningEffort;
     uint32_t TimeoutMs = 5000;
     uint32_t MaxCompletionTokens = 4000;
     bool ForceChunked = false;

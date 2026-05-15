@@ -11,8 +11,11 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <ctime>
+#include <iomanip>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -30,6 +33,14 @@ namespace decomp
 namespace
 {
 constexpr const char* kDefaultLlmConfigFileName = "decomp.llm.json";
+constexpr const char* kChatGptProviderName = "chatgpt";
+constexpr const char* kOpenAICodexProviderName = "openai-codex";
+constexpr const char* kOpenAICompatibleProviderName = "openai-compatible";
+constexpr const char* kChatGptDefaultEndpoint = "https://chatgpt.com/backend-api/codex/responses";
+constexpr const char* kChatGptDefaultModel = "gpt-5.5";
+constexpr const char* kChatGptOAuthClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
+constexpr const char* kChatGptOAuthTokenEndpoint = "https://auth.openai.com/oauth/token";
+constexpr int64_t kChatGptTokenRefreshSkewSeconds = 120;
 
 void LogVerbose(const LlmClientConfig& config, const std::string& message)
 {
@@ -165,6 +176,240 @@ std::string BuildDefaultConfigPath()
     }
 
     return modulePath.substr(0, slash + 1) + kDefaultLlmConfigFileName;
+}
+
+std::string NormalizeProviderName(const std::string& provider)
+{
+    std::string value = ToLowerAscii(TrimCopy(provider));
+
+    if (value.empty())
+    {
+        return kOpenAICompatibleProviderName;
+    }
+
+    if (value == "openai" || value == "openai_compatible" || value == "chat-completions")
+    {
+        return kOpenAICompatibleProviderName;
+    }
+
+    if (value == "chatgpt" || value == "chatgpt-subscription" || value == "codex" || value == "openai-codex" || value == "openai_codex")
+    {
+        return kChatGptProviderName;
+    }
+
+    return value;
+}
+
+bool IsChatGptProvider(const LlmClientConfig& config)
+{
+    const std::string provider = NormalizeProviderName(config.Provider);
+
+    if (provider == kChatGptProviderName || provider == kOpenAICodexProviderName)
+    {
+        return true;
+    }
+
+    return ContainsInsensitive(config.Endpoint, "chatgpt.com/backend-api/codex");
+}
+
+bool EndsWithInsensitive(const std::string& value, const std::string& suffix)
+{
+    if (value.size() < suffix.size())
+    {
+        return false;
+    }
+
+    return ToLowerAscii(value.substr(value.size() - suffix.size())) == ToLowerAscii(suffix);
+}
+
+std::string NormalizeChatGptResponsesEndpoint(const std::string& endpoint)
+{
+    std::string value = TrimCopy(endpoint);
+
+    if (value.empty())
+    {
+        value = kChatGptDefaultEndpoint;
+    }
+
+    if (value.find("://") == std::string::npos)
+    {
+        value = "https://" + value;
+    }
+
+    while (!value.empty() && value.back() == '/')
+    {
+        value.pop_back();
+    }
+
+    if (!EndsWithInsensitive(value, "/responses"))
+    {
+        value += "/responses";
+    }
+
+    return value;
+}
+
+bool TryNormalizeReasoningEffort(
+    const std::string& value,
+    std::string& normalized,
+    std::string& error)
+{
+    normalized = ToLowerAscii(TrimCopy(value));
+
+    if (normalized.empty() || normalized == "default" || normalized == "undefined" || normalized == "none")
+    {
+        normalized.clear();
+        return true;
+    }
+
+    if (normalized == "minimal"
+        || normalized == "low"
+        || normalized == "medium"
+        || normalized == "high"
+        || normalized == "xhigh")
+    {
+        return true;
+    }
+
+    error = "config field 'reasoning_effort' must be undefined, none, minimal, low, medium, high, or xhigh";
+    return false;
+}
+
+std::string GetUserHomeDirectory()
+{
+    std::string home = ReadEnvironmentVariable("USERPROFILE");
+
+    if (!home.empty())
+    {
+        return home;
+    }
+
+    const std::string homeDrive = ReadEnvironmentVariable("HOMEDRIVE");
+    const std::string homePath = ReadEnvironmentVariable("HOMEPATH");
+
+    if (!homeDrive.empty() && !homePath.empty())
+    {
+        return homeDrive + homePath;
+    }
+
+    return std::string();
+}
+
+std::string ExpandConfigPath(const std::string& path)
+{
+    std::string expanded = TrimCopy(path);
+
+    if (expanded.empty())
+    {
+        return expanded;
+    }
+
+    if (expanded == "~" || StartsWithInsensitive(expanded, "~/") || StartsWithInsensitive(expanded, "~\\"))
+    {
+        const std::string home = GetUserHomeDirectory();
+
+        if (!home.empty())
+        {
+            if (expanded.size() == 1)
+            {
+                expanded = home;
+            }
+            else
+            {
+                expanded = home + expanded.substr(1);
+            }
+        }
+    }
+
+    const DWORD required = ExpandEnvironmentStringsA(expanded.c_str(), nullptr, 0);
+
+    if (required == 0)
+    {
+        return expanded;
+    }
+
+    std::string buffer(static_cast<size_t>(required), '\0');
+    const DWORD written = ExpandEnvironmentStringsA(expanded.c_str(), buffer.data(), required);
+
+    if (written == 0 || written > required)
+    {
+        return expanded;
+    }
+
+    if (!buffer.empty() && buffer.back() == '\0')
+    {
+        buffer.pop_back();
+    }
+
+    return buffer;
+}
+
+std::string BuildDefaultChatGptAuthFilePath()
+{
+    const std::string home = GetUserHomeDirectory();
+
+    if (home.empty())
+    {
+        return std::string();
+    }
+
+    return home + "\\.codex\\auth.json";
+}
+
+bool FileExists(const std::string& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::string BuildChatGptAuthBootstrapHint(const LlmClientConfig& config)
+{
+    std::string authPath = TrimCopy(config.ChatGptAuthFile);
+
+    if (authPath.empty())
+    {
+        authPath = BuildDefaultChatGptAuthFilePath();
+    }
+
+    std::string hint = "Run `codex login` outside WinDbg to create or refresh the Codex ChatGPT auth file";
+
+    if (!authPath.empty())
+    {
+        hint += " (" + authPath + ")";
+    }
+
+    hint += ", or set DECOMP_LLM_CHATGPT_AUTH_FILE / DECOMP_LLM_CHATGPT_ACCESS_TOKEN. The extension does not launch a browser.";
+    return hint;
+}
+
+void AppendChatGptAuthBootstrapHint(const LlmClientConfig& config, std::string& error)
+{
+    if (ContainsInsensitive(error, "codex login") || ContainsInsensitive(error, "does not launch a browser"))
+    {
+        return;
+    }
+
+    if (!error.empty())
+    {
+        error += ". ";
+    }
+
+    error += BuildChatGptAuthBootstrapHint(config);
+}
+
+bool IsLikelyChatGptInteractiveLoginRequired(const std::string& error)
+{
+    return ContainsInsensitive(error, "invalid_grant")
+        || ContainsInsensitive(error, "invalid refresh")
+        || ContainsInsensitive(error, "unauthorized")
+        || ContainsInsensitive(error, "http status 401")
+        || ContainsInsensitive(error, "http status 403");
 }
 
 std::string TrimErrorMessage(std::string text)
@@ -568,10 +813,15 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
             break;
         }
 
+        std::string providerValue = config.Provider;
         std::string endpointValue;
         std::string modelValue;
         std::string apiKeyValue;
         std::string apiKeyEnvironmentName;
+        std::string chatGptAccessTokenValue;
+        std::string chatGptAccessTokenEnvironmentName;
+        std::string chatGptAuthFileValue = config.ChatGptAuthFile;
+        std::string reasoningEffortValue = config.ReasoningEffort;
         uint32_t timeoutValue = config.TimeoutMs;
         uint32_t maxCompletionTokensValue = config.MaxCompletionTokens;
         bool forceChunkedValue = config.ForceChunked;
@@ -584,7 +834,12 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
         DisplayLanguageConfig displayLanguageValue = config.DisplayLanguage;
         PseudoCodeHighlightConfig highlightValue = config.Highlight;
 
-        if (!TryReadFirstStringMember(parsed.Value, { "endpoint", "url" }, endpointValue, error))
+        if (!TryReadFirstStringMember(parsed.Value, { "provider", "provider_kind", "providerKind", "kind" }, providerValue, error))
+        {
+            break;
+        }
+
+        if (!TryReadFirstStringMember(parsed.Value, { "endpoint", "url", "base_url", "baseUrl" }, endpointValue, error))
         {
             break;
         }
@@ -595,6 +850,11 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
         }
 
         if (!TryReadFirstStringMember(parsed.Value, { "api_key", "apiKey", "key" }, apiKeyValue, error))
+        {
+            break;
+        }
+
+        if (!TryReadFirstStringMember(parsed.Value, { "access_token", "accessToken", "chatgpt_access_token", "chatGptAccessToken" }, chatGptAccessTokenValue, error))
         {
             break;
         }
@@ -610,6 +870,21 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
         }
 
         if (!TryReadFirstStringMember(parsed.Value, { "api_key_env", "apiKeyEnv" }, apiKeyEnvironmentName, error))
+        {
+            break;
+        }
+
+        if (!TryReadFirstStringMember(parsed.Value, { "access_token_env", "accessTokenEnv", "chatgpt_access_token_env", "chatGptAccessTokenEnv" }, chatGptAccessTokenEnvironmentName, error))
+        {
+            break;
+        }
+
+        if (!TryReadFirstStringMember(parsed.Value, { "auth_file", "authFile", "chatgpt_auth_file", "chatGptAuthFile", "codex_auth_file", "codexAuthFile" }, chatGptAuthFileValue, error))
+        {
+            break;
+        }
+
+        if (!TryReadFirstStringMember(parsed.Value, { "reasoning_effort", "reasoningEffort" }, reasoningEffortValue, error))
         {
             break;
         }
@@ -712,6 +987,8 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
             }
         }
 
+        config.Provider = NormalizeProviderName(providerValue);
+
         if (!endpointValue.empty())
         {
             config.Endpoint = endpointValue;
@@ -722,11 +999,25 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
             config.Model = modelValue;
         }
 
-        if (!apiKeyValue.empty())
+        if (!apiKeyValue.empty() && !IsChatGptProvider(config))
         {
             config.ApiKey = apiKeyValue;
         }
 
+        if (!chatGptAccessTokenValue.empty())
+        {
+            config.ApiKey = chatGptAccessTokenValue;
+        }
+
+        if (!chatGptAuthFileValue.empty())
+        {
+            config.ChatGptAuthFile = ExpandConfigPath(chatGptAuthFileValue);
+        }
+
+        if (!TryNormalizeReasoningEffort(reasoningEffortValue, config.ReasoningEffort, error))
+        {
+            break;
+        }
         config.TimeoutMs = timeoutValue;
         config.MaxCompletionTokens = maxCompletionTokensValue;
         config.ForceChunked = forceChunkedValue;
@@ -739,9 +1030,14 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
         config.DisplayLanguage = displayLanguageValue;
         config.Highlight = highlightValue;
 
-        if (config.ApiKey.empty() && !apiKeyEnvironmentName.empty())
+        if (config.ApiKey.empty() && !apiKeyEnvironmentName.empty() && !IsChatGptProvider(config))
         {
             config.ApiKey = ReadEnvironmentVariable(apiKeyEnvironmentName.c_str());
+        }
+
+        if (config.ApiKey.empty() && !chatGptAccessTokenEnvironmentName.empty())
+        {
+            config.ApiKey = ReadEnvironmentVariable(chatGptAccessTokenEnvironmentName.c_str());
         }
 
         success = true;
@@ -753,9 +1049,14 @@ bool TryLoadConfigFile(LlmClientConfig& config, std::string& error)
 
 void ApplyEnvironmentOverrides(LlmClientConfig& config)
 {
+    const std::string provider = ReadFirstEnvironmentVariable({ "DECOMP_LLM_PROVIDER" });
     const std::string endpoint = ReadFirstEnvironmentVariable({ "DECOMP_LLM_ENDPOINT" });
     const std::string model = ReadFirstEnvironmentVariable({ "DECOMP_LLM_MODEL" });
-    const std::string apiKey = ReadFirstEnvironmentVariable({ "DECOMP_LLM_API_KEY", "OPENAI_API_KEY" });
+    const std::string apiKey = ReadFirstEnvironmentVariable({ "DECOMP_LLM_API_KEY" });
+    const std::string openAiApiKey = ReadFirstEnvironmentVariable({ "OPENAI_API_KEY" });
+    const std::string chatGptAccessToken = ReadFirstEnvironmentVariable({ "DECOMP_LLM_CHATGPT_ACCESS_TOKEN", "DECOMP_LLM_CODEX_ACCESS_TOKEN", "KERNFORGE_CODEX_ACCESS_TOKEN" });
+    const std::string chatGptAuthFile = ReadFirstEnvironmentVariable({ "DECOMP_LLM_CHATGPT_AUTH_FILE", "DECOMP_LLM_CODEX_AUTH_FILE", "KERNFORGE_CODEX_AUTH_FILE" });
+    const std::string reasoningEffort = ReadFirstEnvironmentVariable({ "DECOMP_LLM_REASONING_EFFORT" });
     const std::string timeout = ReadFirstEnvironmentVariable({ "DECOMP_LLM_TIMEOUT_MS" });
     const std::string maxCompletionTokens = ReadFirstEnvironmentVariable({ "DECOMP_LLM_MAX_COMPLETION_TOKENS" });
     const std::string forceChunked = ReadFirstEnvironmentVariable({ "DECOMP_LLM_FORCE_CHUNKED" });
@@ -765,6 +1066,11 @@ void ApplyEnvironmentOverrides(LlmClientConfig& config)
     const std::string chunkCountLimit = ReadFirstEnvironmentVariable({ "DECOMP_LLM_CHUNK_COUNT_LIMIT" });
     const std::string chunkCompletionTokens = ReadFirstEnvironmentVariable({ "DECOMP_LLM_CHUNK_COMPLETION_TOKENS" });
     const std::string mergeCompletionTokens = ReadFirstEnvironmentVariable({ "DECOMP_LLM_MERGE_COMPLETION_TOKENS" });
+
+    if (!provider.empty())
+    {
+        config.Provider = NormalizeProviderName(provider);
+    }
 
     if (!endpoint.empty())
     {
@@ -776,9 +1082,29 @@ void ApplyEnvironmentOverrides(LlmClientConfig& config)
         config.Model = model;
     }
 
-    if (!apiKey.empty())
+    if (!apiKey.empty() && !IsChatGptProvider(config))
     {
         config.ApiKey = apiKey;
+    }
+
+    if (config.ApiKey.empty() && !IsChatGptProvider(config) && !openAiApiKey.empty())
+    {
+        config.ApiKey = openAiApiKey;
+    }
+
+    if (!chatGptAccessToken.empty())
+    {
+        config.ApiKey = chatGptAccessToken;
+    }
+
+    if (!chatGptAuthFile.empty())
+    {
+        config.ChatGptAuthFile = ExpandConfigPath(chatGptAuthFile);
+    }
+
+    if (!reasoningEffort.empty())
+    {
+        config.ReasoningEffort = ToLowerAscii(TrimCopy(reasoningEffort));
     }
 
     if (!timeout.empty())
@@ -871,6 +1197,31 @@ void ApplyEnvironmentOverrides(LlmClientConfig& config)
         }
     }
 }
+
+void ApplyProviderDefaults(LlmClientConfig& config)
+{
+    config.Provider = NormalizeProviderName(config.Provider);
+
+    if (!IsChatGptProvider(config))
+    {
+        return;
+    }
+
+    config.Provider = kChatGptProviderName;
+
+    config.Endpoint = NormalizeChatGptResponsesEndpoint(config.Endpoint);
+
+    if (TrimCopy(config.Model).empty() || config.Model == "local-model")
+    {
+        config.Model = kChatGptDefaultModel;
+    }
+
+    if (TrimCopy(config.ChatGptAuthFile).empty())
+    {
+        config.ChatGptAuthFile = BuildDefaultChatGptAuthFilePath();
+    }
+}
+
 std::string SanitizeIdentifier(const std::string& value)
 {
     std::string sanitized;
@@ -4765,12 +5116,21 @@ bool TryQueryStatusCode(HINTERNET request, DWORD& statusCode)
         WINHTTP_NO_HEADER_INDEX) != FALSE;
 }
 
-bool HttpPostJson(const LlmClientConfig& config, const std::string& body, std::string& responseBody, std::string& error)
+bool HttpPostBody(
+    const LlmClientConfig& config,
+    const std::string& endpointOverride,
+    const std::string& body,
+    const std::string& contentType,
+    const std::string& accept,
+    const std::string& bearerToken,
+    const std::vector<std::pair<std::string, std::string>>& extraHeaders,
+    std::string& responseBody,
+    std::string& error)
 {
     bool success = false;
     const auto started = std::chrono::steady_clock::now();
     URL_COMPONENTSW components = {};
-    std::wstring endpoint = Utf8ToWide(config.Endpoint);
+    std::wstring endpoint = Utf8ToWide(endpointOverride);
     std::wstring host(256, L'\0');
     std::wstring path(2048, L'\0');
     HINTERNET session = nullptr;
@@ -4812,7 +5172,7 @@ bool HttpPostJson(const LlmClientConfig& config, const std::string& body, std::s
 
         LogVerbose(
             config,
-            "LLM HTTP prepare endpoint=" + config.Endpoint
+            "LLM HTTP prepare endpoint=" + endpointOverride
                 + " timeout_ms=" + std::to_string(config.TimeoutMs)
                 + " request_bytes=" + std::to_string(body.size()));
 
@@ -4874,12 +5234,39 @@ bool HttpPostJson(const LlmClientConfig& config, const std::string& body, std::s
             break;
         }
 
-        std::wstring headers = L"Content-Type: application/json\r\n";
+        std::wstring headers;
 
-        if (!config.ApiKey.empty())
+        if (!contentType.empty())
+        {
+            headers += L"Content-Type: ";
+            headers += Utf8ToWide(contentType);
+            headers += L"\r\n";
+        }
+
+        if (!accept.empty())
+        {
+            headers += L"Accept: ";
+            headers += Utf8ToWide(accept);
+            headers += L"\r\n";
+        }
+
+        if (!bearerToken.empty())
         {
             headers += L"Authorization: Bearer ";
-            headers += Utf8ToWide(config.ApiKey);
+            headers += Utf8ToWide(bearerToken);
+            headers += L"\r\n";
+        }
+
+        for (const auto& header : extraHeaders)
+        {
+            if (header.first.empty())
+            {
+                continue;
+            }
+
+            headers += Utf8ToWide(header.first);
+            headers += L": ";
+            headers += Utf8ToWide(header.second);
             headers += L"\r\n";
         }
 
@@ -4991,9 +5378,12 @@ bool HttpPostJson(const LlmClientConfig& config, const std::string& body, std::s
     {
         LogVerbose(config, "LLM HTTP completed elapsed_ms=" + std::to_string(ElapsedMs(started)) + " response_preview=" + BuildPreviewText(responseBody));
     }
-    else if (!error.empty())
+    else
     {
-        LogVerbose(config, "LLM HTTP failed elapsed_ms=" + std::to_string(ElapsedMs(started)) + " error=" + BuildPreviewText(error));
+        if (!error.empty())
+        {
+            LogVerbose(config, "LLM HTTP failed elapsed_ms=" + std::to_string(ElapsedMs(started)) + " error=" + BuildPreviewText(error));
+        }
     }
 
     if (request != nullptr)
@@ -5009,6 +5399,1033 @@ bool HttpPostJson(const LlmClientConfig& config, const std::string& body, std::s
     if (session != nullptr)
     {
         WinHttpCloseHandle(session);
+    }
+
+    return success;
+}
+
+bool HttpPostJson(const LlmClientConfig& config, const std::string& body, std::string& responseBody, std::string& error)
+{
+    return HttpPostBody(
+        config,
+        config.Endpoint,
+        body,
+        "application/json",
+        "application/json",
+        config.ApiKey,
+        {},
+        responseBody,
+        error);
+}
+
+struct ChatGptOAuthTokens
+{
+    std::string AccessToken;
+    std::string RefreshToken;
+    std::string IdToken;
+    std::string AccountId;
+};
+
+std::string ReadObjectStringField(const JsonValue& value, const std::vector<const char*>& names)
+{
+    if (!value.IsObject())
+    {
+        return std::string();
+    }
+
+    for (const char* name : names)
+    {
+        const JsonValue* member = value.Find(name);
+
+        if (member != nullptr && member->IsString())
+        {
+            const std::string text = TrimCopy(member->GetString());
+
+            if (!text.empty())
+            {
+                return text;
+            }
+        }
+    }
+
+    return std::string();
+}
+
+std::string ReadNestedObjectStringField(const JsonValue& value, const char* objectName, const std::vector<const char*>& names)
+{
+    const JsonValue* object = value.Find(objectName);
+
+    if (object == nullptr || !object->IsObject())
+    {
+        return std::string();
+    }
+
+    return ReadObjectStringField(*object, names);
+}
+
+bool ReadChatGptAuthTokens(
+    const std::string& path,
+    std::string& originalText,
+    ChatGptOAuthTokens& tokens,
+    std::string& error)
+{
+    bool success = false;
+
+    do
+    {
+        if (!ReadTextFile(path, originalText, error))
+        {
+            error = "failed to read ChatGPT auth file: " + error;
+            break;
+        }
+
+        const JsonParseResult parsed = ParseJson(originalText);
+
+        if (!parsed.Success || !parsed.Value.IsObject())
+        {
+            error = parsed.Error.empty() ? "ChatGPT auth file is not a JSON object" : parsed.Error;
+            break;
+        }
+
+        tokens.AccessToken = ReadNestedObjectStringField(parsed.Value, "tokens", { "access_token", "accessToken" });
+        tokens.RefreshToken = ReadNestedObjectStringField(parsed.Value, "tokens", { "refresh_token", "refreshToken" });
+        tokens.IdToken = ReadNestedObjectStringField(parsed.Value, "tokens", { "id_token", "idToken" });
+        tokens.AccountId = ReadNestedObjectStringField(parsed.Value, "tokens", { "account_id", "accountId" });
+
+        if (tokens.AccessToken.empty() && tokens.RefreshToken.empty())
+        {
+            error = "ChatGPT auth file does not contain tokens.access_token or tokens.refresh_token: " + path;
+            break;
+        }
+
+        success = true;
+    }
+    while (false);
+
+    return success;
+}
+
+int DecodeBase64UrlCharacter(char ch)
+{
+    if (ch >= 'A' && ch <= 'Z')
+    {
+        return ch - 'A';
+    }
+
+    if (ch >= 'a' && ch <= 'z')
+    {
+        return ch - 'a' + 26;
+    }
+
+    if (ch >= '0' && ch <= '9')
+    {
+        return ch - '0' + 52;
+    }
+
+    if (ch == '-' || ch == '+')
+    {
+        return 62;
+    }
+
+    if (ch == '_' || ch == '/')
+    {
+        return 63;
+    }
+
+    return -1;
+}
+
+bool DecodeBase64Url(const std::string& encoded, std::string& decoded)
+{
+    decoded.clear();
+    int value = 0;
+    int bits = -8;
+
+    for (const char ch : encoded)
+    {
+        if (ch == '=' || ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t')
+        {
+            continue;
+        }
+
+        const int digit = DecodeBase64UrlCharacter(ch);
+
+        if (digit < 0)
+        {
+            return false;
+        }
+
+        value = (value << 6) | digit;
+        bits += 6;
+
+        if (bits >= 0)
+        {
+            decoded.push_back(static_cast<char>((value >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+
+    return true;
+}
+
+bool TryReadJwtExpiration(const std::string& token, int64_t& expiresAt)
+{
+    bool success = false;
+    expiresAt = 0;
+
+    do
+    {
+        const size_t firstDot = token.find('.');
+
+        if (firstDot == std::string::npos)
+        {
+            break;
+        }
+
+        const size_t secondDot = token.find('.', firstDot + 1);
+        const std::string payload = token.substr(
+            firstDot + 1,
+            secondDot == std::string::npos ? std::string::npos : secondDot - firstDot - 1);
+        std::string decoded;
+
+        if (!DecodeBase64Url(payload, decoded))
+        {
+            break;
+        }
+
+        const JsonParseResult parsed = ParseJson(decoded);
+
+        if (!parsed.Success || !parsed.Value.IsObject())
+        {
+            break;
+        }
+
+        const JsonValue* exp = parsed.Value.Find("exp");
+
+        if (exp == nullptr || !exp->IsNumber())
+        {
+            break;
+        }
+
+        expiresAt = static_cast<int64_t>(exp->GetNumber());
+        success = expiresAt > 0;
+    }
+    while (false);
+
+    return success;
+}
+
+bool IsChatGptTokenUsable(const std::string& token)
+{
+    const std::string trimmed = TrimCopy(token);
+
+    if (trimmed.empty())
+    {
+        return false;
+    }
+
+    int64_t expiresAt = 0;
+
+    if (!TryReadJwtExpiration(trimmed, expiresAt))
+    {
+        return true;
+    }
+
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    return now + kChatGptTokenRefreshSkewSeconds < expiresAt;
+}
+
+std::string UrlEncodeFormValue(const std::string& value)
+{
+    std::ostringstream stream;
+    stream << std::uppercase << std::hex;
+
+    for (const unsigned char ch : value)
+    {
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~')
+        {
+            stream << static_cast<char>(ch);
+        }
+        else
+        {
+            if (ch == ' ')
+            {
+                stream << '+';
+            }
+            else
+            {
+                stream << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(ch);
+            }
+        }
+    }
+
+    return stream.str();
+}
+
+std::string BuildFormBody(const std::vector<std::pair<std::string, std::string>>& fields)
+{
+    std::string body;
+
+    for (const auto& field : fields)
+    {
+        if (!body.empty())
+        {
+            body += "&";
+        }
+
+        body += UrlEncodeFormValue(field.first);
+        body += "=";
+        body += UrlEncodeFormValue(field.second);
+    }
+
+    return body;
+}
+
+bool WriteTextFile(const std::string& path, const std::string& text, std::string& error)
+{
+    bool success = false;
+    const std::string tempPath = path + ".tmp." + MakeRequestId();
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    do
+    {
+        file = CreateFileA(
+            tempPath.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            error = DescribeWinHttpError("CreateFile", GetLastError()) + ": " + tempPath;
+            break;
+        }
+
+        DWORD written = 0;
+
+        if (!WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) || written != text.size())
+        {
+            error = DescribeWinHttpError("WriteFile", GetLastError()) + ": " + tempPath;
+            break;
+        }
+
+        if (!FlushFileBuffers(file))
+        {
+            error = DescribeWinHttpError("FlushFileBuffers", GetLastError()) + ": " + tempPath;
+            break;
+        }
+
+        CloseHandle(file);
+        file = INVALID_HANDLE_VALUE;
+
+        if (!MoveFileExA(tempPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        {
+            error = DescribeWinHttpError("MoveFileEx", GetLastError()) + ": " + tempPath + " -> " + path;
+            break;
+        }
+
+        success = true;
+    }
+    while (false);
+
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+    }
+
+    if (!success && !tempPath.empty())
+    {
+        DeleteFileA(tempPath.c_str());
+    }
+
+    return success;
+}
+
+bool UpdateChatGptAuthFile(
+    const std::string& path,
+    const std::string& originalText,
+    const ChatGptOAuthTokens& tokens,
+    std::string& error)
+{
+    bool success = false;
+
+    do
+    {
+        const JsonParseResult parsed = ParseJson(originalText);
+
+        if (!parsed.Success || !parsed.Value.IsObject())
+        {
+            error = parsed.Error.empty() ? "ChatGPT auth file is not a JSON object" : parsed.Error;
+            break;
+        }
+
+        JsonValue root = parsed.Value;
+        JsonValue tokenObject = JsonValue::MakeObject();
+        const JsonValue* existingTokens = root.Find("tokens");
+
+        if (existingTokens != nullptr && existingTokens->IsObject())
+        {
+            tokenObject = *existingTokens;
+        }
+
+        if (!tokens.AccessToken.empty())
+        {
+            tokenObject.Set("access_token", JsonValue::MakeString(tokens.AccessToken));
+        }
+
+        if (!tokens.RefreshToken.empty())
+        {
+            tokenObject.Set("refresh_token", JsonValue::MakeString(tokens.RefreshToken));
+        }
+
+        if (!tokens.IdToken.empty())
+        {
+            tokenObject.Set("id_token", JsonValue::MakeString(tokens.IdToken));
+        }
+
+        if (!tokens.AccountId.empty())
+        {
+            tokenObject.Set("account_id", JsonValue::MakeString(tokens.AccountId));
+        }
+
+        root.Set("tokens", tokenObject);
+        root.Set("auth_mode", JsonValue::MakeString("chatgpt"));
+
+        std::string output = SerializeJson(root, true);
+        output += "\n";
+
+        if (!WriteTextFile(path, output, error))
+        {
+            break;
+        }
+
+        success = true;
+    }
+    while (false);
+
+    return success;
+}
+
+std::string ExtractJsonErrorMessage(const JsonValue& root)
+{
+    const JsonValue* errorObject = root.Find("error");
+
+    if (errorObject == nullptr)
+    {
+        return std::string();
+    }
+
+    if (errorObject->IsString())
+    {
+        return errorObject->GetString();
+    }
+
+    if (!errorObject->IsObject())
+    {
+        return std::string();
+    }
+
+    std::string message = ReadObjectStringField(*errorObject, { "message", "detail", "error_description", "type", "code" });
+
+    if (message.empty())
+    {
+        message = SerializeJson(*errorObject, false);
+    }
+
+    return message;
+}
+
+bool RefreshChatGptAccessToken(
+    const LlmClientConfig& config,
+    const std::string& refreshToken,
+    ChatGptOAuthTokens& tokens,
+    std::string& error)
+{
+    bool success = false;
+    const std::string body = BuildFormBody({
+        { "grant_type", "refresh_token" },
+        { "refresh_token", refreshToken },
+        { "client_id", kChatGptOAuthClientId }
+    });
+    std::string responseBody;
+
+    do
+    {
+        if (!HttpPostBody(
+                config,
+                kChatGptOAuthTokenEndpoint,
+                body,
+                "application/x-www-form-urlencoded",
+                "application/json",
+                std::string(),
+                { { "User-Agent", "WindbgLlmDecompExtension/openai-codex" } },
+                responseBody,
+                error))
+        {
+            break;
+        }
+
+        const JsonParseResult parsed = ParseJson(responseBody);
+
+        if (!parsed.Success || !parsed.Value.IsObject())
+        {
+            error = parsed.Error.empty() ? "ChatGPT OAuth refresh returned invalid JSON" : parsed.Error;
+            break;
+        }
+
+        const std::string providerError = ExtractJsonErrorMessage(parsed.Value);
+
+        if (!providerError.empty())
+        {
+            error = "ChatGPT OAuth refresh failed: " + providerError;
+            break;
+        }
+
+        tokens.AccessToken = ReadObjectStringField(parsed.Value, { "access_token", "accessToken" });
+        tokens.RefreshToken = ReadObjectStringField(parsed.Value, { "refresh_token", "refreshToken" });
+        tokens.IdToken = ReadObjectStringField(parsed.Value, { "id_token", "idToken" });
+        tokens.AccountId = ReadObjectStringField(parsed.Value, { "account_id", "accountId" });
+
+        if (tokens.AccessToken.empty())
+        {
+            error = "ChatGPT OAuth refresh returned no access token";
+            break;
+        }
+
+        success = true;
+    }
+    while (false);
+
+    return success;
+}
+
+bool ResolveChatGptAccessToken(
+    const LlmClientConfig& config,
+    std::string& accessToken,
+    std::string& error)
+{
+    bool success = false;
+
+    do
+    {
+        accessToken = TrimCopy(config.ApiKey);
+
+        if (!accessToken.empty())
+        {
+            success = true;
+            break;
+        }
+
+        const std::string authPath = TrimCopy(config.ChatGptAuthFile).empty() ? BuildDefaultChatGptAuthFilePath() : config.ChatGptAuthFile;
+
+        if (authPath.empty())
+        {
+            error = "ChatGPT auth file path is unavailable; set chatgpt_auth_file or DECOMP_LLM_CHATGPT_AUTH_FILE";
+            AppendChatGptAuthBootstrapHint(config, error);
+            break;
+        }
+
+        std::string originalText;
+        ChatGptOAuthTokens tokens;
+
+        if (!ReadChatGptAuthTokens(authPath, originalText, tokens, error))
+        {
+            AppendChatGptAuthBootstrapHint(config, error);
+            break;
+        }
+
+        if (IsChatGptTokenUsable(tokens.AccessToken))
+        {
+            accessToken = tokens.AccessToken;
+            success = true;
+            break;
+        }
+
+        if (TrimCopy(tokens.RefreshToken).empty())
+        {
+            error = "ChatGPT access token is expired and no refresh token is available: " + authPath;
+            AppendChatGptAuthBootstrapHint(config, error);
+            break;
+        }
+
+        ChatGptOAuthTokens refreshed;
+
+        LogProgress(config, "ChatGPT access token expired; refreshing OAuth token");
+
+        if (!RefreshChatGptAccessToken(config, tokens.RefreshToken, refreshed, error))
+        {
+            if (IsLikelyChatGptInteractiveLoginRequired(error))
+            {
+                AppendChatGptAuthBootstrapHint(config, error);
+            }
+
+            break;
+        }
+
+        if (!UpdateChatGptAuthFile(authPath, originalText, refreshed, error))
+        {
+            error = "failed to update ChatGPT auth file after refresh: " + error;
+            break;
+        }
+
+        accessToken = refreshed.AccessToken;
+        success = true;
+    }
+    while (false);
+
+    return success;
+}
+
+JsonValue BuildChatGptResponsesRequestBody(
+    const LlmClientConfig& config,
+    const std::string& systemPrompt,
+    const std::string& userPrompt,
+    uint32_t maxCompletionTokens)
+{
+    JsonValue content = JsonValue::MakeArray();
+    JsonValue text = JsonValue::MakeObject();
+    text.Set("type", JsonValue::MakeString("input_text"));
+    text.Set("text", JsonValue::MakeString(userPrompt));
+    content.PushBack(text);
+
+    JsonValue inputItem = JsonValue::MakeObject();
+    inputItem.Set("role", JsonValue::MakeString("user"));
+    inputItem.Set("content", content);
+
+    JsonValue input = JsonValue::MakeArray();
+    input.PushBack(inputItem);
+
+    JsonValue include = JsonValue::MakeArray();
+    include.PushBack(JsonValue::MakeString("reasoning.encrypted_content"));
+
+    JsonValue responseFormat = JsonValue::MakeObject();
+    responseFormat.Set("type", JsonValue::MakeString("json_object"));
+
+    JsonValue textFormat = JsonValue::MakeObject();
+    textFormat.Set("format", responseFormat);
+
+    JsonValue body = JsonValue::MakeObject();
+    body.Set("model", JsonValue::MakeString(config.Model));
+    body.Set("input", input);
+    body.Set("instructions", JsonValue::MakeString(systemPrompt));
+    body.Set("store", JsonValue::MakeBoolean(false));
+    body.Set("stream", JsonValue::MakeBoolean(true));
+    body.Set("include", include);
+    body.Set("parallel_tool_calls", JsonValue::MakeBoolean(true));
+    body.Set("max_output_tokens", JsonValue::MakeNumber(static_cast<double>(maxCompletionTokens)));
+    body.Set("text", textFormat);
+
+    if (!TrimCopy(config.ReasoningEffort).empty())
+    {
+        JsonValue reasoning = JsonValue::MakeObject();
+        reasoning.Set("effort", JsonValue::MakeString(ToLowerAscii(TrimCopy(config.ReasoningEffort))));
+        body.Set("reasoning", reasoning);
+    }
+
+    return body;
+}
+
+void AppendUniqueText(std::vector<std::string>& texts, const std::string& text)
+{
+    const std::string trimmed = TrimCopy(text);
+
+    if (trimmed.empty())
+    {
+        return;
+    }
+
+    for (const std::string& existing : texts)
+    {
+        if (existing == trimmed)
+        {
+            return;
+        }
+    }
+
+    texts.push_back(trimmed);
+}
+
+std::optional<std::string> ExtractResponsesContent(const JsonValue& root)
+{
+    std::vector<std::string> texts;
+    const JsonValue* outputText = root.Find("output_text");
+
+    if (outputText != nullptr && outputText->IsString())
+    {
+        AppendUniqueText(texts, outputText->GetString());
+    }
+
+    const JsonValue* output = root.Find("output");
+
+    if (output != nullptr && output->IsArray())
+    {
+        for (const JsonValue& item : output->GetArray())
+        {
+            if (!item.IsObject())
+            {
+                continue;
+            }
+
+            const JsonValue* content = item.Find("content");
+
+            if (content == nullptr || !content->IsArray())
+            {
+                continue;
+            }
+
+            for (const JsonValue& contentItem : content->GetArray())
+            {
+                if (!contentItem.IsObject())
+                {
+                    continue;
+                }
+
+                const JsonValue* text = contentItem.Find("text");
+
+                if (text != nullptr && text->IsString())
+                {
+                    AppendUniqueText(texts, text->GetString());
+                }
+            }
+        }
+    }
+
+    if (texts.empty())
+    {
+        return std::nullopt;
+    }
+
+    return JoinStrings(texts, "\n");
+}
+
+std::string ExtractResponsesFinishReason(const JsonValue& root)
+{
+    const JsonValue* incompleteDetails = root.Find("incomplete_details");
+
+    if (incompleteDetails != nullptr && incompleteDetails->IsObject())
+    {
+        const std::string reason = ReadObjectStringField(*incompleteDetails, { "reason", "type", "message" });
+
+        if (!reason.empty())
+        {
+            return reason;
+        }
+    }
+
+    return ReadObjectStringField(root, { "status", "finish_reason" });
+}
+
+bool IsChatGptLengthReason(const std::string& reason)
+{
+    const std::string lowered = ToLowerAscii(reason);
+
+    return ContainsInsensitive(lowered, "length")
+        || ContainsInsensitive(lowered, "token")
+        || ContainsInsensitive(lowered, "max_output");
+}
+
+bool ParseChatGptResponseObject(
+    const JsonValue& root,
+    std::string& modelJson,
+    std::string& error,
+    bool& outputTruncated)
+{
+    outputTruncated = false;
+    const std::string providerError = ExtractJsonErrorMessage(root);
+
+    if (!providerError.empty())
+    {
+        error = providerError;
+        return false;
+    }
+
+    const std::string finishReason = ExtractResponsesFinishReason(root);
+    const std::optional<std::string> content = ExtractResponsesContent(root);
+    outputTruncated = IsChatGptLengthReason(finishReason);
+
+    if (!content.has_value())
+    {
+        if (outputTruncated)
+        {
+            error = "model output was truncated before content extraction";
+        }
+        else
+        {
+            error = "ChatGPT Responses output did not include message content";
+        }
+
+        return false;
+    }
+
+    modelJson = StripCodeFences(content.value());
+    return true;
+}
+
+bool ParseChatGptResponsesStream(
+    const std::string& responseBody,
+    std::string& modelJson,
+    std::string& error,
+    bool& outputTruncated)
+{
+    bool success = false;
+    bool sawStreamData = false;
+    std::string streamText;
+    std::string finishReason;
+    std::optional<JsonValue> completedResponse;
+    size_t offset = 0;
+
+    outputTruncated = false;
+
+    do
+    {
+        while (offset <= responseBody.size())
+        {
+            const size_t end = responseBody.find('\n', offset);
+            std::string line = end == std::string::npos ? responseBody.substr(offset) : responseBody.substr(offset, end - offset);
+
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.pop_back();
+            }
+
+            line = TrimCopy(line);
+
+            if (end == std::string::npos)
+            {
+                offset = responseBody.size() + 1;
+            }
+            else
+            {
+                offset = end + 1;
+            }
+
+            if (line.empty() || line[0] == ':' || StartsWithInsensitive(line, "event:"))
+            {
+                continue;
+            }
+
+            if (!StartsWithInsensitive(line, "data:"))
+            {
+                continue;
+            }
+
+            sawStreamData = true;
+            const std::string payload = TrimCopy(line.substr(5));
+
+            if (payload.empty() || payload == "[DONE]")
+            {
+                continue;
+            }
+
+            const JsonParseResult parsed = ParseJson(payload);
+
+            if (!parsed.Success || !parsed.Value.IsObject())
+            {
+                error = parsed.Error.empty() ? "ChatGPT Responses stream contained invalid JSON" : parsed.Error;
+                break;
+            }
+
+            const std::string providerError = ExtractJsonErrorMessage(parsed.Value);
+
+            if (!providerError.empty())
+            {
+                error = providerError;
+                break;
+            }
+
+            const std::string eventType = ReadObjectStringField(parsed.Value, { "type" });
+
+            if (eventType == "response.output_text.delta")
+            {
+                streamText += ReadObjectStringField(parsed.Value, { "delta" });
+            }
+            else
+            {
+                if (eventType == "response.output_text.done")
+                {
+                    if (streamText.empty())
+                    {
+                        streamText = ReadObjectStringField(parsed.Value, { "text" });
+                    }
+                }
+                else
+                {
+                    if (eventType == "response.completed" || eventType == "response.incomplete" || eventType == "response.failed")
+                    {
+                        const JsonValue* response = parsed.Value.Find("response");
+
+                        if (response != nullptr && response->IsObject())
+                        {
+                            completedResponse = *response;
+                            finishReason = ExtractResponsesFinishReason(*response);
+                        }
+
+                        if (eventType == "response.incomplete" && finishReason.empty())
+                        {
+                            finishReason = "incomplete";
+                        }
+
+                        if (eventType == "response.failed")
+                        {
+                            if (completedResponse.has_value())
+                            {
+                                std::string ignoredText;
+                                bool ignoredTruncated = false;
+
+                                if (!ParseChatGptResponseObject(completedResponse.value(), ignoredText, error, ignoredTruncated))
+                                {
+                                    break;
+                                }
+                            }
+
+                            error = "ChatGPT Responses stream failed";
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (offset > responseBody.size())
+            {
+                break;
+            }
+        }
+
+        if (!error.empty())
+        {
+            break;
+        }
+
+        if (!sawStreamData)
+        {
+            const JsonParseResult parsed = ParseJson(responseBody);
+
+            if (!parsed.Success || !parsed.Value.IsObject())
+            {
+                error = parsed.Error.empty() ? "ChatGPT provider returned invalid JSON" : parsed.Error;
+                break;
+            }
+
+            success = ParseChatGptResponseObject(parsed.Value, modelJson, error, outputTruncated);
+            break;
+        }
+
+        if (completedResponse.has_value())
+        {
+            std::string completedJson;
+            bool completedTruncated = false;
+
+            if (ParseChatGptResponseObject(completedResponse.value(), completedJson, error, completedTruncated))
+            {
+                modelJson = completedJson;
+                outputTruncated = completedTruncated;
+                success = true;
+                break;
+            }
+
+            if (streamText.empty())
+            {
+                break;
+            }
+
+            error.clear();
+            outputTruncated = completedTruncated;
+        }
+
+        if (streamText.empty())
+        {
+            error = "ChatGPT Responses stream did not include output text";
+            break;
+        }
+
+        outputTruncated = outputTruncated || IsChatGptLengthReason(finishReason);
+        modelJson = StripCodeFences(streamText);
+        success = true;
+    }
+    while (false);
+
+    return success;
+}
+
+bool SubmitChatGptJsonAttempt(
+    const LlmClientConfig& config,
+    const std::string& systemPrompt,
+    const std::string& userPrompt,
+    uint32_t maxCompletionTokens,
+    std::string& modelJson,
+    std::string& error,
+    bool& outputTruncated)
+{
+    bool success = false;
+    outputTruncated = false;
+    const auto started = std::chrono::steady_clock::now();
+    std::string accessToken;
+
+    do
+    {
+        if (FailIfCancellationRequested(config, error))
+        {
+            break;
+        }
+
+        if (!ResolveChatGptAccessToken(config, accessToken, error))
+        {
+            break;
+        }
+
+        JsonValue body = BuildChatGptResponsesRequestBody(config, systemPrompt, userPrompt, maxCompletionTokens);
+        const std::string requestBody = SerializeJson(body, false);
+        std::string responseBody;
+        const std::string requestId = MakeRequestId();
+
+        LogVerbose(
+            config,
+            "ChatGPT Responses submit attempt model=" + config.Model
+                + " max_output_tokens=" + std::to_string(maxCompletionTokens)
+                + " reasoning_effort=" + (config.ReasoningEffort.empty() ? std::string("<default>") : config.ReasoningEffort)
+                + " system_chars=" + std::to_string(systemPrompt.size())
+                + " user_chars=" + std::to_string(userPrompt.size()));
+
+        if (!HttpPostBody(
+                config,
+                config.Endpoint,
+                requestBody,
+                "application/json",
+                "text/event-stream",
+                accessToken,
+                {
+                    { "originator", "codex_cli_rs" },
+                    { "User-Agent", "WindbgLlmDecompExtension/openai-codex" },
+                    { "session_id", requestId },
+                    { "x-client-request-id", requestId }
+                },
+                responseBody,
+                error))
+        {
+            break;
+        }
+
+        if (!ParseChatGptResponsesStream(responseBody, modelJson, error, outputTruncated))
+        {
+            break;
+        }
+
+        LogVerbose(
+            config,
+            "ChatGPT Responses content extracted chars=" + std::to_string(modelJson.size())
+                + " truncated=" + std::string(outputTruncated ? "true" : "false")
+                + " preview=" + BuildPreviewText(modelJson));
+
+        success = true;
+    }
+    while (false);
+
+    if (!success)
+    {
+        LogVerbose(config, "ChatGPT Responses submit failed elapsed_ms=" + std::to_string(ElapsedMs(started)) + " error=" + BuildPreviewText(error));
     }
 
     return success;
@@ -5053,10 +6470,23 @@ bool LoadLlmClientConfig(
         }
 
         ApplyEnvironmentOverrides(config);
+        ApplyProviderDefaults(config);
+
+        if (!TryNormalizeReasoningEffort(config.ReasoningEffort, config.ReasoningEffort, error))
+        {
+            break;
+        }
 
         if (validateProviderSettings && !config.Endpoint.empty() && config.ApiKey.empty() && ContainsInsensitive(config.Endpoint, "api.openai.com"))
         {
             error = "api key is empty; set api_key or api_key_env in " + BuildDefaultConfigPath() + ", or set DECOMP_LLM_API_KEY/OPENAI_API_KEY";
+            break;
+        }
+
+        if (validateProviderSettings && IsChatGptProvider(config) && config.ApiKey.empty() && !FileExists(config.ChatGptAuthFile))
+        {
+            error = "ChatGPT auth is not configured; set access_token/access_token_env or chatgpt_auth_file in " + BuildDefaultConfigPath();
+            AppendChatGptAuthBootstrapHint(config, error);
             break;
         }
 
@@ -5100,6 +6530,18 @@ bool SubmitChatJsonAttempt(
     if (FailIfCancellationRequested(config, error))
     {
         return false;
+    }
+
+    if (IsChatGptProvider(config))
+    {
+        return SubmitChatGptJsonAttempt(
+            config,
+            systemPrompt,
+            userPrompt,
+            maxCompletionTokens,
+            modelJson,
+            error,
+            outputTruncated);
     }
 
     LogVerbose(
