@@ -222,6 +222,24 @@ struct IrValue
     double Confidence = 0.0;
 };
 
+struct ReachingValue
+{
+    std::string Name;
+    std::string ValueId;
+    std::string Canonical;
+    std::string Storage;
+    double Confidence = 0.0;
+};
+
+struct BlockValueState
+{
+    std::string BlockId;
+    std::vector<ReachingValue> LiveIn;
+    std::vector<ReachingValue> LiveOut;
+    bool Converged = true;
+    double Confidence = 0.0;
+};
+
 struct ControlFlowRegion
 {
     std::string Kind;
@@ -447,6 +465,32 @@ struct ObservedBehaviorFacts
     double Confidence = 0.0;
 };
 
+struct EvidenceNode
+{
+    std::string Id;
+    std::string Kind;
+    std::string Label;
+    uint64_t Site = 0;
+    std::string BlockId;
+    double Confidence = 0.0;
+};
+
+struct EvidenceEdge
+{
+    std::string SourceId;
+    std::string TargetId;
+    std::string Relation;
+    double Confidence = 0.0;
+};
+
+struct EvidenceGraphFacts
+{
+    std::vector<EvidenceNode> Nodes;
+    std::vector<EvidenceEdge> Edges;
+    std::vector<std::string> Notes;
+    double Coverage = 0.0;
+};
+
 struct AnalysisFacts
 {
     std::string Arch = "x64";
@@ -474,6 +518,7 @@ struct AnalysisFacts
     std::vector<CallArgumentFact> CallArguments;
     std::vector<ValueMerge> ValueMerges;
     std::vector<IrValue> IrValues;
+    std::vector<BlockValueState> BlockValueStates;
     std::vector<ControlFlowRegion> ControlFlow;
     AbiFacts Abi;
     std::vector<TypeRecoveryHint> TypeHints;
@@ -485,6 +530,7 @@ struct AnalysisFacts
     PdbFacts Pdb;
     SessionPolicyFacts SessionPolicy;
     ObservedBehaviorFacts ObservedBehavior;
+    EvidenceGraphFacts EvidenceGraph;
     std::vector<std::string> Facts;
     std::vector<std::string> UncertainPoints;
     double PreLlmConfidence = 0.0;

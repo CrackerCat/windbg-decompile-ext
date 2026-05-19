@@ -4691,30 +4691,30 @@ std::vector<IrValue> CollectIrValues(
                 }
             }
 
-                if (value.Kind == "call_result")
+            if (value.Kind == "call_result")
+            {
+                for (const char* reg : VolatileIntegerRegisters())
                 {
-                    for (const char* reg : VolatileIntegerRegisters())
-                    {
-                        const auto clobbered = ids.find(reg);
+                    const auto clobbered = ids.find(reg);
 
                     if (clobbered != ids.end())
                     {
-                            overwrittenValueIds.insert(clobbered->second);
-                        }
+                        overwrittenValueIds.insert(clobbered->second);
                     }
-
-                    for (const char* reg : VolatileVectorRegisters())
-                    {
-                        const auto clobbered = ids.find(reg);
-
-                        if (clobbered != ids.end())
-                        {
-                            overwrittenValueIds.insert(clobbered->second);
-                        }
-                    }
-
-                    EraseCallClobberedValues(ids, canonicalByTarget);
                 }
+
+                for (const char* reg : VolatileVectorRegisters())
+                {
+                    const auto clobbered = ids.find(reg);
+
+                    if (clobbered != ids.end())
+                    {
+                        overwrittenValueIds.insert(clobbered->second);
+                    }
+                }
+
+                EraseCallClobberedValues(ids, canonicalByTarget);
+            }
 
             ids[value.Target] = value.Id;
             canonicalByTarget[value.Target] = value.Canonical.empty() ? value.Expression : value.Canonical;
@@ -4729,6 +4729,183 @@ std::vector<IrValue> CollectIrValues(
     }
 
     return values;
+}
+
+std::string ClassifyReachingValueStorage(const std::string& name)
+{
+    if (IsRegisterName(name) || IsVectorRegisterName(name))
+    {
+        return "register";
+    }
+
+    if (StartsWithInsensitive(name, "local_"))
+    {
+        return "stack_local";
+    }
+
+    if (name.find('[') != std::string::npos)
+    {
+        return "memory";
+    }
+
+    return "value";
+}
+
+std::vector<ReachingValue> BuildReachingValues(
+    const StringMap& ids,
+    const StringMap& canonicalByTarget,
+    const std::unordered_map<std::string, const IrValue*>& valuesById,
+    bool converged)
+{
+    std::vector<std::string> names;
+    std::vector<ReachingValue> values;
+
+    for (const auto& entry : ids)
+    {
+        names.push_back(entry.first);
+    }
+
+    std::sort(names.begin(), names.end());
+
+    for (const std::string& name : names)
+    {
+        const auto idIt = ids.find(name);
+
+        if (idIt == ids.end())
+        {
+            continue;
+        }
+
+        ReachingValue value;
+        value.Name = name;
+        value.ValueId = idIt->second;
+        value.Storage = ClassifyReachingValueStorage(name);
+        value.Confidence = converged ? 0.74 : 0.45;
+
+        const auto canonicalIt = canonicalByTarget.find(name);
+
+        if (canonicalIt != canonicalByTarget.end())
+        {
+            value.Canonical = canonicalIt->second;
+        }
+
+        const auto valueIt = valuesById.find(value.ValueId);
+
+        if (valueIt != valuesById.end())
+        {
+            if (value.Canonical.empty())
+            {
+                value.Canonical = valueIt->second->Canonical.empty()
+                    ? valueIt->second->Expression
+                    : valueIt->second->Canonical;
+            }
+
+            value.Confidence = Clamp01((value.Confidence * 0.35) + (valueIt->second->Confidence * 0.65));
+        }
+
+        values.push_back(std::move(value));
+    }
+
+    return values;
+}
+
+std::vector<BlockValueState> CollectBlockValueStates(
+    const std::vector<BasicBlock>& blocks,
+    const std::vector<IrValue>& irValues)
+{
+    std::unordered_map<std::string, std::vector<const IrValue*>> valuesByBlock;
+    std::unordered_map<std::string, const IrValue*> valuesById;
+    std::unordered_map<std::string, StringMap> inIdsByBlock;
+    std::unordered_map<std::string, StringMap> outIdsByBlock;
+    std::unordered_map<std::string, StringMap> inCanonicalByBlock;
+    std::unordered_map<std::string, StringMap> outCanonicalByBlock;
+    std::vector<BlockValueState> states;
+
+    for (const IrValue& value : irValues)
+    {
+        valuesByBlock[value.BlockId].push_back(&value);
+        valuesById[value.Id] = &value;
+    }
+
+    for (const BasicBlock& block : blocks)
+    {
+        inIdsByBlock[block.Id] = StringMap();
+        outIdsByBlock[block.Id] = StringMap();
+        inCanonicalByBlock[block.Id] = StringMap();
+        outCanonicalByBlock[block.Id] = StringMap();
+    }
+
+    const std::unordered_map<std::string, std::vector<std::string>> predecessors = BuildBlockPredecessors(blocks);
+    bool changed = true;
+    size_t iterations = 0;
+
+    while (changed && iterations++ < blocks.size() + 1U)
+    {
+        changed = false;
+
+        for (const BasicBlock& block : blocks)
+        {
+            StringMap inIds;
+            StringMap inCanonical;
+            const auto predecessorIt = predecessors.find(block.Id);
+
+            if (&block != &blocks.front() && predecessorIt != predecessors.end())
+            {
+                inIds = MergePredecessorStringMaps(predecessorIt->second, outIdsByBlock);
+                inCanonical = MergePredecessorStringMaps(predecessorIt->second, outCanonicalByBlock);
+            }
+
+            StringMap outIds = inIds;
+            StringMap outCanonical = inCanonical;
+            const auto valuesIt = valuesByBlock.find(block.Id);
+
+            if (valuesIt != valuesByBlock.end())
+            {
+                for (const IrValue* value : valuesIt->second)
+                {
+                    if (value == nullptr || value->Target.empty())
+                    {
+                        continue;
+                    }
+
+                    if (value->Kind == "call_result")
+                    {
+                        EraseCallClobberedValues(outIds, outCanonical);
+                    }
+
+                    outIds[value->Target] = value->Id;
+                    outCanonical[value->Target] = value->Canonical.empty() ? value->Expression : value->Canonical;
+                }
+            }
+
+            if (!StringMapsEqual(inIdsByBlock[block.Id], inIds)
+                || !StringMapsEqual(outIdsByBlock[block.Id], outIds)
+                || !StringMapsEqual(inCanonicalByBlock[block.Id], inCanonical)
+                || !StringMapsEqual(outCanonicalByBlock[block.Id], outCanonical))
+            {
+                inIdsByBlock[block.Id] = std::move(inIds);
+                outIdsByBlock[block.Id] = std::move(outIds);
+                inCanonicalByBlock[block.Id] = std::move(inCanonical);
+                outCanonicalByBlock[block.Id] = std::move(outCanonical);
+                changed = true;
+            }
+        }
+    }
+
+    const bool converged = !changed;
+
+    for (const BasicBlock& block : blocks)
+    {
+        BlockValueState state;
+        state.BlockId = block.Id;
+        state.Converged = converged;
+        state.LiveIn = BuildReachingValues(inIdsByBlock[block.Id], inCanonicalByBlock[block.Id], valuesById, converged);
+        state.LiveOut = BuildReachingValues(outIdsByBlock[block.Id], outCanonicalByBlock[block.Id], valuesById, converged);
+        state.Confidence = converged ? 0.76 : 0.42;
+        states.push_back(std::move(state));
+    }
+
+    return states;
 }
 
 bool TryGetRawStackDisplacement(const MemoryAccess& access, int64_t& displacement)
@@ -7269,6 +7446,563 @@ std::vector<NormalizedCondition> CollectNormalizedConditions(
     return conditions;
 }
 
+std::string BuildEvidenceBlockNodeId(const std::string& blockId)
+{
+    return "block:" + blockId;
+}
+
+std::string BuildEvidenceInstructionNodeId(uint64_t site)
+{
+    return "insn:" + HexU64(site);
+}
+
+std::string BuildEvidenceIndexedNodeId(const std::string& prefix, size_t index)
+{
+    return prefix + ":" + std::to_string(index);
+}
+
+struct EvidenceGraphBuilder
+{
+    EvidenceGraphFacts Graph;
+    std::unordered_set<std::string> NodeIds;
+    std::unordered_set<std::string> EdgeIds;
+    std::unordered_map<uint64_t, const DisassembledInstruction*> InstructionByAddress;
+    std::unordered_map<uint64_t, std::string> BlockByAddress;
+
+    explicit EvidenceGraphBuilder(const AnalysisFacts& facts)
+    {
+        BlockByAddress = BuildBlockIdByInstructionAddress(facts.Blocks);
+
+        for (const DisassembledInstruction& instruction : facts.Instructions)
+        {
+            InstructionByAddress[instruction.Address] = &instruction;
+        }
+    }
+
+    void AddNode(EvidenceNode node)
+    {
+        if (node.Id.empty())
+        {
+            return;
+        }
+
+        if (!NodeIds.insert(node.Id).second)
+        {
+            return;
+        }
+
+        Graph.Nodes.push_back(std::move(node));
+    }
+
+    void AddEdge(const std::string& sourceId, const std::string& targetId, const std::string& relation, double confidence)
+    {
+        if (sourceId.empty() || targetId.empty() || relation.empty())
+        {
+            return;
+        }
+
+        const std::string edgeId = sourceId + "\n" + relation + "\n" + targetId;
+
+        if (!EdgeIds.insert(edgeId).second)
+        {
+            return;
+        }
+
+        EvidenceEdge edge;
+        edge.SourceId = sourceId;
+        edge.TargetId = targetId;
+        edge.Relation = relation;
+        edge.Confidence = Clamp01(confidence);
+        Graph.Edges.push_back(std::move(edge));
+    }
+
+    void AddBlock(const BasicBlock& block)
+    {
+        EvidenceNode node;
+        node.Id = BuildEvidenceBlockNodeId(block.Id);
+        node.Kind = "basic_block";
+        node.Label = HexU64(block.StartAddress) + "-" + HexU64(block.EndAddress);
+        node.Site = block.StartAddress;
+        node.BlockId = block.Id;
+        node.Confidence = block.HasTerminal ? 0.90 : 0.72;
+        AddNode(std::move(node));
+    }
+
+    void AddInstruction(uint64_t site)
+    {
+        if (site == 0)
+        {
+            return;
+        }
+
+        const auto instructionIt = InstructionByAddress.find(site);
+        const auto blockIt = BlockByAddress.find(site);
+
+        EvidenceNode node;
+        node.Id = BuildEvidenceInstructionNodeId(site);
+        node.Kind = "instruction";
+        node.Site = site;
+        node.BlockId = blockIt == BlockByAddress.end() ? std::string() : blockIt->second;
+        node.Confidence = instructionIt == InstructionByAddress.end() ? 0.55 : 1.0;
+
+        if (instructionIt != InstructionByAddress.end())
+        {
+            node.Label = instructionIt->second->OperationText.empty()
+                ? instructionIt->second->Text
+                : instructionIt->second->OperationText;
+        }
+        else
+        {
+            node.Label = HexU64(site);
+        }
+
+        AddNode(std::move(node));
+
+        if (blockIt != BlockByAddress.end())
+        {
+            AddEdge(BuildEvidenceInstructionNodeId(site), BuildEvidenceBlockNodeId(blockIt->second), "in_block", 0.95);
+        }
+    }
+
+    std::string AddSiteFact(
+        const std::string& id,
+        const std::string& kind,
+        const std::string& label,
+        uint64_t site,
+        const std::string& blockId,
+        double confidence)
+    {
+        std::string effectiveBlock = blockId;
+
+        if (effectiveBlock.empty() && site != 0)
+        {
+            const auto blockIt = BlockByAddress.find(site);
+
+            if (blockIt != BlockByAddress.end())
+            {
+                effectiveBlock = blockIt->second;
+            }
+        }
+
+        EvidenceNode node;
+        node.Id = id;
+        node.Kind = kind;
+        node.Label = label;
+        node.Site = site;
+        node.BlockId = effectiveBlock;
+        node.Confidence = Clamp01(confidence);
+        AddNode(std::move(node));
+
+        if (site != 0)
+        {
+            AddInstruction(site);
+            AddEdge(id, BuildEvidenceInstructionNodeId(site), "at_instruction", confidence);
+        }
+
+        if (!effectiveBlock.empty())
+        {
+            AddEdge(id, BuildEvidenceBlockNodeId(effectiveBlock), "in_block", confidence);
+        }
+
+        return id;
+    }
+
+    void FinalizeCoverage()
+    {
+        size_t semanticNodes = 0;
+        size_t groundedNodes = 0;
+
+        for (const EvidenceNode& node : Graph.Nodes)
+        {
+            if (node.Kind == "basic_block" || node.Kind == "instruction")
+            {
+                continue;
+            }
+
+            ++semanticNodes;
+
+            if (node.Site != 0 || !node.BlockId.empty())
+            {
+                ++groundedNodes;
+            }
+        }
+
+        Graph.Coverage = semanticNodes == 0
+            ? 0.0
+            : static_cast<double>(groundedNodes) / static_cast<double>(semanticNodes);
+    }
+};
+
+EvidenceGraphFacts BuildEvidenceGraphFacts(const AnalysisFacts& facts)
+{
+    EvidenceGraphBuilder builder(facts);
+
+    for (const BasicBlock& block : facts.Blocks)
+    {
+        builder.AddBlock(block);
+
+        for (const std::string& successor : block.Successors)
+        {
+            if (!successor.empty())
+            {
+                builder.AddEdge(BuildEvidenceBlockNodeId(block.Id), BuildEvidenceBlockNodeId(successor), "cfg_successor", 0.90);
+            }
+        }
+    }
+
+    for (size_t index = 0; index < facts.MemoryAccesses.size(); ++index)
+    {
+        const MemoryAccess& access = facts.MemoryAccesses[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("memory", index),
+            "memory_access",
+            access.Kind + " " + access.Access,
+            access.Site,
+            std::string(),
+            access.Implicit ? 0.70 : 0.86);
+    }
+
+    for (size_t index = 0; index < facts.RecoveredArguments.size(); ++index)
+    {
+        const RecoveredArgument& argument = facts.RecoveredArguments[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("argument", index),
+            "recovered_argument",
+            argument.Name + ":" + argument.Register,
+            argument.FirstUseSite,
+            std::string(),
+            argument.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.RecoveredLocals.size(); ++index)
+    {
+        const RecoveredLocal& local = facts.RecoveredLocals[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("local", index),
+            "recovered_local",
+            local.Name + " " + local.Storage,
+            local.FirstSite,
+            std::string(),
+            local.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.CallArguments.size(); ++index)
+    {
+        const CallArgumentFact& argument = facts.CallArguments[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("call_arg", index),
+            "call_argument",
+            "arg" + std::to_string(argument.Ordinal) + " " + argument.Location + "=" + argument.Expression,
+            argument.Site,
+            std::string(),
+            argument.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.ValueMerges.size(); ++index)
+    {
+        const ValueMerge& merge = facts.ValueMerges[index];
+        const std::string nodeId = builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("merge", index),
+            "value_merge",
+            merge.Variable + " <- " + JoinStrings(merge.IncomingValues, ","),
+            0,
+            merge.BlockId,
+            merge.Confidence);
+
+        for (const std::string& predecessor : merge.Predecessors)
+        {
+            if (!predecessor.empty())
+            {
+                builder.AddEdge(nodeId, BuildEvidenceBlockNodeId(predecessor), "merge_predecessor", merge.Confidence);
+            }
+        }
+    }
+
+    for (size_t index = 0; index < facts.IrValues.size(); ++index)
+    {
+        const IrValue& value = facts.IrValues[index];
+        const std::string nodeId = builder.AddSiteFact(
+            "ir:" + value.Id,
+            "ir_value",
+            value.Target + "=" + value.Canonical,
+            value.DefSite,
+            value.BlockId,
+            value.Confidence);
+
+        for (const std::string& use : value.Uses)
+        {
+            builder.AddEdge(nodeId, "ir:" + use, "uses_value", value.Confidence);
+        }
+    }
+
+    for (const BlockValueState& state : facts.BlockValueStates)
+    {
+        const std::string nodeId = builder.AddSiteFact(
+            "block_state:" + state.BlockId,
+            "block_value_state",
+            "live_in=" + std::to_string(state.LiveIn.size()) + " live_out=" + std::to_string(state.LiveOut.size()),
+            0,
+            state.BlockId,
+            state.Confidence);
+
+        for (const ReachingValue& value : state.LiveIn)
+        {
+            if (!value.ValueId.empty())
+            {
+                builder.AddEdge("ir:" + value.ValueId, nodeId, "live_in", value.Confidence);
+            }
+        }
+
+        for (const ReachingValue& value : state.LiveOut)
+        {
+            if (!value.ValueId.empty())
+            {
+                builder.AddEdge(nodeId, "ir:" + value.ValueId, "live_out", value.Confidence);
+            }
+        }
+    }
+
+    for (size_t index = 0; index < facts.ControlFlow.size(); ++index)
+    {
+        const ControlFlowRegion& region = facts.ControlFlow[index];
+        const std::string nodeId = builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("control_flow", index),
+            "control_flow_region",
+            region.Kind + " " + region.Condition,
+            0,
+            region.HeaderBlock,
+            region.Confidence);
+
+        for (const std::string& block : region.BodyBlocks)
+        {
+            if (!block.empty())
+            {
+                builder.AddEdge(nodeId, BuildEvidenceBlockNodeId(block), "region_body", region.Confidence);
+            }
+        }
+
+        for (const std::string& block : region.LatchBlocks)
+        {
+            if (!block.empty())
+            {
+                builder.AddEdge(nodeId, BuildEvidenceBlockNodeId(block), "region_latch", region.Confidence);
+            }
+        }
+
+        for (const std::string& block : region.ExitBlocks)
+        {
+            if (!block.empty())
+            {
+                builder.AddEdge(nodeId, BuildEvidenceBlockNodeId(block), "region_exit", region.Confidence);
+            }
+        }
+    }
+
+    for (size_t index = 0; index < facts.TypeHints.size(); ++index)
+    {
+        const TypeRecoveryHint& hint = facts.TypeHints[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("type_hint", index),
+            "type_hint",
+            hint.Expression + ":" + hint.Type,
+            hint.Site,
+            std::string(),
+            hint.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.Idioms.size(); ++index)
+    {
+        const IdiomPattern& idiom = facts.Idioms[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("idiom", index),
+            "idiom",
+            idiom.Kind + " " + idiom.Name,
+            idiom.Site,
+            std::string(),
+            idiom.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.CalleeSummaries.size(); ++index)
+    {
+        const CalleeSummary& summary = facts.CalleeSummaries[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("callee", index),
+            "callee_summary",
+            summary.Callee + " " + summary.MemoryEffects,
+            summary.Site,
+            std::string(),
+            summary.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.DataReferences.size(); ++index)
+    {
+        const DataReference& reference = facts.DataReferences[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("data_ref", index),
+            "data_reference",
+            reference.Display.empty() ? reference.Symbol : reference.Display,
+            reference.Site,
+            std::string(),
+            reference.Dereferenced ? 0.82 : 0.74);
+    }
+
+    for (size_t index = 0; index < facts.CallTargets.size(); ++index)
+    {
+        const CallTargetInfo& target = facts.CallTargets[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("call_target", index),
+            "call_target",
+            target.DisplayName.empty() ? target.TargetExpression : target.DisplayName,
+            target.Site,
+            std::string(),
+            target.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.NormalizedConditions.size(); ++index)
+    {
+        const NormalizedCondition& condition = facts.NormalizedConditions[index];
+        const std::string nodeId = builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("condition", index),
+            "normalized_condition",
+            condition.Expression,
+            condition.Site,
+            condition.BlockId,
+            condition.Confidence);
+
+        if (!condition.TrueTargetBlock.empty())
+        {
+            builder.AddEdge(nodeId, BuildEvidenceBlockNodeId(condition.TrueTargetBlock), "true_target", condition.Confidence);
+        }
+
+        if (!condition.FalseTargetBlock.empty())
+        {
+            builder.AddEdge(nodeId, BuildEvidenceBlockNodeId(condition.FalseTargetBlock), "false_target", condition.Confidence);
+        }
+    }
+
+    if (!facts.Pdb.FunctionName.empty())
+    {
+        builder.AddSiteFact(
+            "pdb:function",
+            "pdb_function",
+            facts.Pdb.FunctionName,
+            facts.EntryAddress,
+            std::string(),
+            facts.Pdb.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.Pdb.Params.size(); ++index)
+    {
+        const PdbScopedSymbol& symbol = facts.Pdb.Params[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("pdb_param", index),
+            "pdb_param",
+            symbol.Name + ":" + symbol.Type,
+            symbol.Site,
+            std::string(),
+            symbol.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.Pdb.Locals.size(); ++index)
+    {
+        const PdbScopedSymbol& symbol = facts.Pdb.Locals[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("pdb_local", index),
+            "pdb_local",
+            symbol.Name + ":" + symbol.Type,
+            symbol.Site,
+            std::string(),
+            symbol.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.Pdb.FieldHints.size(); ++index)
+    {
+        const PdbFieldHint& hint = facts.Pdb.FieldHints[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("pdb_field", index),
+            "pdb_field",
+            hint.BaseName + "->" + hint.FieldName,
+            hint.Site,
+            std::string(),
+            hint.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.Pdb.EnumHints.size(); ++index)
+    {
+        const PdbEnumHint& hint = facts.Pdb.EnumHints[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("pdb_enum", index),
+            "pdb_enum",
+            hint.Expression + "=" + hint.ConstantName,
+            hint.Site,
+            std::string(),
+            hint.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.Pdb.SourceLocations.size(); ++index)
+    {
+        const PdbSourceLocation& source = facts.Pdb.SourceLocations[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("pdb_source", index),
+            "pdb_source_location",
+            source.File + ":" + std::to_string(source.Line),
+            source.Site,
+            std::string(),
+            source.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.ObservedBehavior.ArgumentSamples.size(); ++index)
+    {
+        const ObservedArgumentValue& argument = facts.ObservedBehavior.ArgumentSamples[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("observed_arg", index),
+            "observed_argument",
+            argument.Name + ":" + HexU64(argument.Value),
+            facts.ObservedBehavior.CurrentInstructionInFunction ? facts.ObservedBehavior.InstructionPointer : 0,
+            std::string(),
+            argument.Confidence);
+    }
+
+    for (size_t index = 0; index < facts.ObservedBehavior.MemoryHotspots.size(); ++index)
+    {
+        const ObservedMemoryHotspot& hotspot = facts.ObservedBehavior.MemoryHotspots[index];
+        builder.AddSiteFact(
+            BuildEvidenceIndexedNodeId("observed_hotspot", index),
+            "observed_memory_hotspot",
+            hotspot.Kind + " " + hotspot.Expression,
+            hotspot.Sites.empty() ? 0 : hotspot.Sites.front(),
+            std::string(),
+            hotspot.Confidence);
+    }
+
+    builder.Graph.Notes.push_back("Evidence graph links high-signal facts to instruction and block evidence.");
+    builder.Graph.Notes.push_back("PDB and observed nodes are included when the graph is refreshed after debug enrichment.");
+    builder.FinalizeCoverage();
+    return builder.Graph;
+}
+
+void UpdateEvidenceGraphSummaryFact(AnalysisFacts& facts)
+{
+    facts.Facts.erase(
+        std::remove_if(
+            facts.Facts.begin(),
+            facts.Facts.end(),
+            [](const std::string& fact)
+            {
+                return StartsWithInsensitive(fact, "evidence graph:");
+            }),
+        facts.Facts.end());
+
+    if (!facts.EvidenceGraph.Nodes.empty() || !facts.EvidenceGraph.Edges.empty())
+    {
+        facts.Facts.push_back(
+            "evidence graph: nodes="
+            + std::to_string(facts.EvidenceGraph.Nodes.size())
+            + ", edges="
+            + std::to_string(facts.EvidenceGraph.Edges.size()));
+    }
+}
+
 double ScoreConfidence(
     const ModuleInfo& moduleInfo,
     const std::vector<FunctionRegion>& regions,
@@ -7345,6 +8079,7 @@ void RefreshDerivedAnalysisFacts(AnalysisFacts& facts)
         facts.MemoryAccesses,
         facts.RecoveredArguments,
         facts.RecoveredLocals);
+    facts.BlockValueStates = CollectBlockValueStates(facts.Blocks, facts.IrValues);
     facts.NormalizedConditions = CollectNormalizedConditions(
         facts.Instructions,
         facts.Blocks,
@@ -7352,6 +8087,13 @@ void RefreshDerivedAnalysisFacts(AnalysisFacts& facts)
         facts.RecoveredArguments,
         facts.RecoveredLocals);
     facts.ControlFlow = AnalyzeControlFlow(facts.Instructions, facts.Blocks, facts.NormalizedConditions, facts.Switches);
+    RefreshEvidenceGraph(facts);
+}
+
+void RefreshEvidenceGraph(AnalysisFacts& facts)
+{
+    facts.EvidenceGraph = BuildEvidenceGraphFacts(facts);
+    UpdateEvidenceGraphSummaryFact(facts);
 }
 
 void ApplyRecoveredSwitchTargets(AnalysisFacts& facts)
@@ -7428,6 +8170,7 @@ AnalysisFacts BuildAnalysisFacts(
     facts.CallArguments = CollectCallArgumentFacts(instructions, facts.Blocks, facts.MemoryAccesses, facts.RecoveredArguments, facts.RecoveredLocals);
     facts.ValueMerges = CollectValueMerges(instructions, facts.Blocks, facts.MemoryAccesses, facts.RecoveredArguments, facts.RecoveredLocals);
     facts.IrValues = CollectIrValues(instructions, facts.Blocks, facts.MemoryAccesses, facts.RecoveredArguments, facts.RecoveredLocals);
+    facts.BlockValueStates = CollectBlockValueStates(facts.Blocks, facts.IrValues);
     facts.NormalizedConditions = CollectNormalizedConditions(instructions, facts.Blocks, facts.MemoryAccesses, facts.RecoveredArguments, facts.RecoveredLocals);
     facts.ControlFlow = AnalyzeControlFlow(facts.Instructions, facts.Blocks, facts.NormalizedConditions, facts.Switches);
     facts.Abi = AnalyzeAbiFacts(instructions, facts.MemoryAccesses, facts.StackFrame, entryAddress);
@@ -7609,6 +8352,31 @@ AnalysisFacts BuildAnalysisFacts(
             + ")");
     }
 
+    if (!facts.BlockValueStates.empty())
+    {
+        size_t liveInEntries = 0;
+        size_t liveOutEntries = 0;
+        size_t unconvergedBlocks = 0;
+
+        for (const BlockValueState& state : facts.BlockValueStates)
+        {
+            liveInEntries += state.LiveIn.size();
+            liveOutEntries += state.LiveOut.size();
+            unconvergedBlocks += state.Converged ? 0U : 1U;
+        }
+
+        facts.Facts.push_back(
+            "block value states: "
+            + std::to_string(facts.BlockValueStates.size())
+            + " (live_in="
+            + std::to_string(liveInEntries)
+            + ", live_out="
+            + std::to_string(liveOutEntries)
+            + ", unconverged="
+            + std::to_string(unconvergedBlocks)
+            + ")");
+    }
+
     if (!facts.NormalizedConditions.empty())
     {
         facts.Facts.push_back("normalized branch conditions: " + std::to_string(facts.NormalizedConditions.size()));
@@ -7708,6 +8476,7 @@ AnalysisFacts BuildAnalysisFacts(
         facts.Blocks,
         facts.UncertainPoints,
         facts.Calls);
+    RefreshEvidenceGraph(facts);
 
     return facts;
 }

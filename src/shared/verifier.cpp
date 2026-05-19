@@ -999,6 +999,143 @@ void CheckEvidenceCoverage(const AnalyzeRequest& request, const AnalyzeResponse&
     }
 }
 
+void CheckEvidenceGraphConsistency(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
+{
+    std::set<std::string> blockIds;
+    std::set<std::string> nodeIds;
+
+    for (const BasicBlock& block : request.Facts.Blocks)
+    {
+        blockIds.insert(block.Id);
+    }
+
+    if (request.Facts.EvidenceGraph.Nodes.empty()
+        && (!request.Facts.IrValues.empty()
+            || !request.Facts.BlockValueStates.empty()
+            || !request.Facts.ControlFlow.empty()
+            || !request.Facts.TypeHints.empty()
+            || !request.Facts.CalleeSummaries.empty())
+        && response.Confidence > 0.60)
+    {
+        ++report.MissingEvidence;
+        AddIssue(
+            report,
+            "evidence_graph.missing",
+            "warning",
+            "high-confidence response has semantic analyzer facts but no evidence graph");
+    }
+
+    for (const EvidenceNode& node : request.Facts.EvidenceGraph.Nodes)
+    {
+        if (!node.Id.empty())
+        {
+            nodeIds.insert(node.Id);
+        }
+
+        if (!node.BlockId.empty() && blockIds.find(node.BlockId) == blockIds.end())
+        {
+            ++report.FactConflicts;
+            AddIssue(
+                report,
+                "evidence_graph.node_block_missing",
+                "warning",
+                "evidence graph node references a missing basic block",
+                node.Id + " block=" + node.BlockId);
+        }
+    }
+
+    for (const EvidenceEdge& edge : request.Facts.EvidenceGraph.Edges)
+    {
+        if (nodeIds.find(edge.SourceId) == nodeIds.end()
+            || nodeIds.find(edge.TargetId) == nodeIds.end())
+        {
+            ++report.FactConflicts;
+            AddIssue(
+                report,
+                "evidence_graph.edge_endpoint_missing",
+                "warning",
+                "evidence graph edge references a missing node",
+                edge.SourceId + " -> " + edge.TargetId);
+        }
+    }
+
+    if (!request.Facts.EvidenceGraph.Nodes.empty()
+        && request.Facts.EvidenceGraph.Coverage < 0.30
+        && response.Confidence > 0.70)
+    {
+        ++report.MissingEvidence;
+        AddIssue(
+            report,
+            "evidence_graph.low_coverage",
+            "warning",
+            "high-confidence response has weak analyzer evidence graph grounding",
+            "coverage=" + std::to_string(request.Facts.EvidenceGraph.Coverage));
+    }
+}
+
+void CheckBlockValueStateConsistency(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
+{
+    std::set<std::string> blockIds;
+    std::set<std::string> valueIds;
+    bool hasUnconvergedState = false;
+
+    for (const BasicBlock& block : request.Facts.Blocks)
+    {
+        blockIds.insert(block.Id);
+    }
+
+    for (const IrValue& value : request.Facts.IrValues)
+    {
+        valueIds.insert(value.Id);
+    }
+
+    for (const BlockValueState& state : request.Facts.BlockValueStates)
+    {
+        if (!state.BlockId.empty() && blockIds.find(state.BlockId) == blockIds.end())
+        {
+            ++report.FactConflicts;
+            AddIssue(
+                report,
+                "dataflow.block_state_missing_block",
+                "warning",
+                "block value state references a missing basic block",
+                state.BlockId);
+        }
+
+        hasUnconvergedState = hasUnconvergedState || !state.Converged;
+
+        auto checkValues = [&valueIds, &report](const std::vector<ReachingValue>& values, const std::string& direction)
+        {
+            for (const ReachingValue& value : values)
+            {
+                if (!value.ValueId.empty() && valueIds.find(value.ValueId) == valueIds.end())
+                {
+                    ++report.FactConflicts;
+                    AddIssue(
+                        report,
+                        "dataflow.reaching_value_missing_ir",
+                        "warning",
+                        "block value state references a missing IR value",
+                        direction + " " + value.Name + "=" + value.ValueId);
+                }
+            }
+        };
+
+        checkValues(state.LiveIn, "live_in");
+        checkValues(state.LiveOut, "live_out");
+    }
+
+    if (hasUnconvergedState && response.Confidence > 0.70 && response.Uncertainties.empty())
+    {
+        ++report.MissingEvidence;
+        AddIssue(
+            report,
+            "dataflow.unconverged_without_uncertainty",
+            "warning",
+            "high-confidence response omitted uncertainty despite unconverged block value dataflow");
+    }
+}
+
 void CheckCalleeSummaryConsistency(const AnalyzeRequest& request, const AnalyzeResponse& response, VerifyReport& report)
 {
     for (const auto& summary : request.Facts.CalleeSummaries)
@@ -1163,6 +1300,8 @@ VerifyReport VerifyResponse(const AnalyzeRequest& request, AnalyzeResponse& resp
     CheckRecoveredCallArgumentConsistency(request, response, report);
     CheckResponseNameGrounding(request, response, report);
     CheckEvidenceCoverage(request, response, report);
+    CheckEvidenceGraphConsistency(request, response, report);
+    CheckBlockValueStateConsistency(request, response, report);
 
     if (MentionsLoop(response) && !GraphHasBackEdge(request.Facts))
     {

@@ -264,6 +264,41 @@ JsonValue ToJson(const IrValue& value)
     return object;
 }
 
+JsonValue ToJson(const ReachingValue& value)
+{
+    JsonValue object = JsonValue::MakeObject();
+    object.Set("name", JsonValue::MakeString(value.Name));
+    object.Set("value_id", JsonValue::MakeString(value.ValueId));
+    object.Set("canonical", JsonValue::MakeString(value.Canonical));
+    object.Set("storage", JsonValue::MakeString(value.Storage));
+    object.Set("confidence", JsonValue::MakeNumber(value.Confidence));
+    return object;
+}
+
+JsonValue ToJson(const BlockValueState& state)
+{
+    JsonValue object = JsonValue::MakeObject();
+    JsonValue liveIn = JsonValue::MakeArray();
+    JsonValue liveOut = JsonValue::MakeArray();
+
+    for (const ReachingValue& value : state.LiveIn)
+    {
+        liveIn.PushBack(ToJson(value));
+    }
+
+    for (const ReachingValue& value : state.LiveOut)
+    {
+        liveOut.PushBack(ToJson(value));
+    }
+
+    object.Set("block_id", JsonValue::MakeString(state.BlockId));
+    object.Set("live_in", liveIn);
+    object.Set("live_out", liveOut);
+    object.Set("converged", JsonValue::MakeBoolean(state.Converged));
+    object.Set("confidence", JsonValue::MakeNumber(state.Confidence));
+    return object;
+}
+
 JsonValue ToJson(const ControlFlowRegion& region)
 {
     JsonValue object = JsonValue::MakeObject();
@@ -672,6 +707,57 @@ JsonValue ToJson(const ObservedBehaviorFacts& observed)
     object.Set("ttd_queries", ttdQueries);
     object.Set("notes", notes);
     object.Set("confidence", JsonValue::MakeNumber(observed.Confidence));
+    return object;
+}
+
+JsonValue ToJson(const EvidenceNode& node)
+{
+    JsonValue object = JsonValue::MakeObject();
+    object.Set("id", JsonValue::MakeString(node.Id));
+    object.Set("kind", JsonValue::MakeString(node.Kind));
+    object.Set("label", JsonValue::MakeString(node.Label));
+    object.Set("site", JsonValue::MakeString(HexU64(node.Site)));
+    object.Set("block_id", JsonValue::MakeString(node.BlockId));
+    object.Set("confidence", JsonValue::MakeNumber(node.Confidence));
+    return object;
+}
+
+JsonValue ToJson(const EvidenceEdge& edge)
+{
+    JsonValue object = JsonValue::MakeObject();
+    object.Set("source_id", JsonValue::MakeString(edge.SourceId));
+    object.Set("target_id", JsonValue::MakeString(edge.TargetId));
+    object.Set("relation", JsonValue::MakeString(edge.Relation));
+    object.Set("confidence", JsonValue::MakeNumber(edge.Confidence));
+    return object;
+}
+
+JsonValue ToJson(const EvidenceGraphFacts& graph)
+{
+    JsonValue object = JsonValue::MakeObject();
+    JsonValue nodes = JsonValue::MakeArray();
+    JsonValue edges = JsonValue::MakeArray();
+    JsonValue notes = JsonValue::MakeArray();
+
+    for (const EvidenceNode& node : graph.Nodes)
+    {
+        nodes.PushBack(ToJson(node));
+    }
+
+    for (const EvidenceEdge& edge : graph.Edges)
+    {
+        edges.PushBack(ToJson(edge));
+    }
+
+    for (const std::string& note : graph.Notes)
+    {
+        notes.PushBack(JsonValue::MakeString(note));
+    }
+
+    object.Set("nodes", nodes);
+    object.Set("edges", edges);
+    object.Set("notes", notes);
+    object.Set("coverage", JsonValue::MakeNumber(graph.Coverage));
     return object;
 }
 
@@ -1089,6 +1175,48 @@ bool ParseIrValue(const JsonValue& object, IrValue& value)
     return true;
 }
 
+bool ParseReachingValue(const JsonValue& object, ReachingValue& value)
+{
+    TryGetString(object, "name", value.Name);
+    TryGetString(object, "value_id", value.ValueId);
+    TryGetString(object, "canonical", value.Canonical);
+    TryGetString(object, "storage", value.Storage);
+    TryGetDouble(object, "confidence", value.Confidence);
+    return true;
+}
+
+void ParseReachingValueArrayMember(const JsonValue& object, const std::string& key, std::vector<ReachingValue>& values)
+{
+    const JsonValue* array = object.Find(key);
+
+    if (array == nullptr || !array->IsArray())
+    {
+        return;
+    }
+
+    for (const auto& item : array->GetArray())
+    {
+        if (!item.IsObject())
+        {
+            continue;
+        }
+
+        ReachingValue value;
+        ParseReachingValue(item, value);
+        values.push_back(std::move(value));
+    }
+}
+
+bool ParseBlockValueState(const JsonValue& object, BlockValueState& state)
+{
+    TryGetString(object, "block_id", state.BlockId);
+    TryGetBool(object, "converged", state.Converged);
+    TryGetDouble(object, "confidence", state.Confidence);
+    ParseReachingValueArrayMember(object, "live_in", state.LiveIn);
+    ParseReachingValueArrayMember(object, "live_out", state.LiveOut);
+    return true;
+}
+
 bool ParseControlFlowRegion(const JsonValue& object, ControlFlowRegion& region)
 {
     TryGetString(object, "kind", region.Kind);
@@ -1463,6 +1591,7 @@ JsonValue ToJson(const AnalyzeRequest& request)
     JsonValue callArguments = JsonValue::MakeArray();
     JsonValue valueMerges = JsonValue::MakeArray();
     JsonValue irValues = JsonValue::MakeArray();
+    JsonValue blockValueStates = JsonValue::MakeArray();
     JsonValue controlFlow = JsonValue::MakeArray();
     JsonValue typeHints = JsonValue::MakeArray();
     JsonValue idioms = JsonValue::MakeArray();
@@ -1538,6 +1667,11 @@ JsonValue ToJson(const AnalyzeRequest& request)
         irValues.PushBack(ToJson(value));
     }
 
+    for (const auto& state : request.Facts.BlockValueStates)
+    {
+        blockValueStates.PushBack(ToJson(state));
+    }
+
     for (const auto& region : request.Facts.ControlFlow)
     {
         controlFlow.PushBack(ToJson(region));
@@ -1611,6 +1745,7 @@ JsonValue ToJson(const AnalyzeRequest& request)
     object.Set("call_arguments", callArguments);
     object.Set("value_merges", valueMerges);
     object.Set("ir_values", irValues);
+    object.Set("block_value_states", blockValueStates);
     object.Set("control_flow", controlFlow);
     object.Set("abi", ToJson(request.Facts.Abi));
     object.Set("type_hints", typeHints);
@@ -1622,6 +1757,7 @@ JsonValue ToJson(const AnalyzeRequest& request)
     object.Set("pdb", ToJson(request.Facts.Pdb));
     object.Set("session_policy", ToJson(request.Facts.SessionPolicy));
     object.Set("observed_behavior", ToJson(request.Facts.ObservedBehavior));
+    object.Set("evidence_graph", ToJson(request.Facts.EvidenceGraph));
     object.Set("facts", facts);
     object.Set("uncertain_points", uncertainPoints);
     object.Set("pre_llm_confidence", JsonValue::MakeNumber(request.Facts.PreLlmConfidence));
@@ -1692,6 +1828,7 @@ std::string SerializeAnalyzeResponse(const AnalyzeResponse& response, bool prett
 
 bool ParseSessionPolicyFacts(const JsonValue& object, SessionPolicyFacts& policy);
 bool ParseObservedBehaviorFacts(const JsonValue& object, ObservedBehaviorFacts& observed);
+bool ParseEvidenceGraphFacts(const JsonValue& object, EvidenceGraphFacts& graph);
 
 bool ParseAnalyzeRequest(const std::string& text, AnalyzeRequest& request, std::string& error)
 {
@@ -2077,6 +2214,23 @@ bool ParseAnalyzeRequest(const std::string& text, AnalyzeRequest& request, std::
         }
     }
 
+    const JsonValue* blockValueStates = object.Find("block_value_states");
+
+    if (blockValueStates != nullptr && blockValueStates->IsArray())
+    {
+        for (const auto& item : blockValueStates->GetArray())
+        {
+            if (!item.IsObject())
+            {
+                continue;
+            }
+
+            BlockValueState state;
+            ParseBlockValueState(item, state);
+            request.Facts.BlockValueStates.push_back(state);
+        }
+    }
+
     const JsonValue* controlFlow = object.Find("control_flow");
 
     if (controlFlow != nullptr && controlFlow->IsArray())
@@ -2224,6 +2378,13 @@ bool ParseAnalyzeRequest(const std::string& text, AnalyzeRequest& request, std::
         ParseObservedBehaviorFacts(*observedBehavior, request.Facts.ObservedBehavior);
     }
 
+    const JsonValue* evidenceGraph = object.Find("evidence_graph");
+
+    if (evidenceGraph != nullptr && evidenceGraph->IsObject())
+    {
+        ParseEvidenceGraphFacts(*evidenceGraph, request.Facts.EvidenceGraph);
+    }
+
     const JsonValue* facts = object.Find("facts");
 
     if (facts != nullptr && facts->IsArray())
@@ -2346,6 +2507,68 @@ bool ParseObservedBehaviorFacts(const JsonValue& object, ObservedBehaviorFacts& 
             ObservedMemoryHotspot hotspot;
             ParseObservedMemoryHotspot(item, hotspot);
             observed.MemoryHotspots.push_back(hotspot);
+        }
+    }
+
+    return true;
+}
+
+bool ParseEvidenceNode(const JsonValue& object, EvidenceNode& node)
+{
+    TryGetString(object, "id", node.Id);
+    TryGetString(object, "kind", node.Kind);
+    TryGetString(object, "label", node.Label);
+    TryGetU64(object, "site", node.Site);
+    TryGetString(object, "block_id", node.BlockId);
+    TryGetDouble(object, "confidence", node.Confidence);
+    return true;
+}
+
+bool ParseEvidenceEdge(const JsonValue& object, EvidenceEdge& edge)
+{
+    TryGetString(object, "source_id", edge.SourceId);
+    TryGetString(object, "target_id", edge.TargetId);
+    TryGetString(object, "relation", edge.Relation);
+    TryGetDouble(object, "confidence", edge.Confidence);
+    return true;
+}
+
+bool ParseEvidenceGraphFacts(const JsonValue& object, EvidenceGraphFacts& graph)
+{
+    TryGetDouble(object, "coverage", graph.Coverage);
+    ParseStringArrayMember(object, "notes", graph.Notes);
+
+    const JsonValue* nodes = object.Find("nodes");
+
+    if (nodes != nullptr && nodes->IsArray())
+    {
+        for (const auto& item : nodes->GetArray())
+        {
+            if (!item.IsObject())
+            {
+                continue;
+            }
+
+            EvidenceNode node;
+            ParseEvidenceNode(item, node);
+            graph.Nodes.push_back(std::move(node));
+        }
+    }
+
+    const JsonValue* edges = object.Find("edges");
+
+    if (edges != nullptr && edges->IsArray())
+    {
+        for (const auto& item : edges->GetArray())
+        {
+            if (!item.IsObject())
+            {
+                continue;
+            }
+
+            EvidenceEdge edge;
+            ParseEvidenceEdge(item, edge);
+            graph.Edges.push_back(std::move(edge));
         }
     }
 

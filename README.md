@@ -20,12 +20,14 @@ This project is a Windows x64 WinDbg extension skeleton that resolves a function
 - symbol-region, unwind, and heuristic function-range recovery
 - SSA-lite style recovery for incoming register arguments, stack-slot locals, merge candidates, and normalized branch conditions
 - low-level IR value facts with def-use hints, canonicalized copy/constant expressions, and dead-definition markers
+- block-level value state facts for converged live-in/live-out reaching definitions across registers and stack locals
 - dominator-backed control-flow region facts for natural loops, if/else candidates, switch candidates, loop induction metadata, and switch range/default metadata
 - x64 ABI facts for shadow/home slots, stack pointer deltas, prolog/epilog recognition, no-return calls, tail calls, thunks, import-wrapper candidates, and recovered register/stack call arguments
 - SIMD/FP-aware Microsoft x64 argument recovery for `xmm0` through `xmm3`, with vector zero-idiom guards to avoid false incoming arguments
 - type recovery hints for pointer-like values, stack locals, field offsets, scaled-index arrays, enum-like compares, bitflag tests, and vtable candidates
 - idiom and library-pattern facts for memory/string helpers, security cookies, stack probes, allocators, aggregate initializers, and RIP-relative global/import loads
 - call-target facts for direct calls, register/memory indirect calls, virtual-call/vtable-offset candidates, return type, parameter model, side effects, memory effects, ownership hints, and confidence
+- evidence graph facts that link high-signal analyzer, PDB, and observed behavior facts back to instruction/block grounding
 - refine-first prompting with an analyzer-generated pseudocode skeleton, graph-aware summaries for CFG regions, conditions, and important blocks, ranked high-signal fact selection, and spread sampling for large fact sets
 - WinDbg DML links for entry/basic-block/evidence/call-target navigation when the output callback supports DML
 - separated result modes for brief, evidence explanation, facts-only, debug prompt, JSON, and data-model style output
@@ -675,8 +677,9 @@ Example `/view:json` response details:
 - `pseudo_c_tokens` is a deterministic token stream suitable for external syntax highlighting.
 - The serialized request includes `preferred_natural_language_tag` and `preferred_natural_language_name`, which reflect the resolved display language after applying `display_language.mode`.
 - Analyzer facts now include P0 quality fields:
-  `ir_values`, `control_flow`, and `abi`.
+  `ir_values`, `block_value_states`, `control_flow`, and `abi`.
 - `ir_values` exposes SSA-like value ids, definition sites, targets, canonical expressions, use links, constant/copy flags, and dead-definition hints.
+- `block_value_states` exposes per-basic-block live-in/live-out reaching definitions, canonical values, storage class, convergence state, and confidence.
 - `stack_pointer` exposes per-instruction stack deltas, frame-relative aliases, raw base/offsets, and confidence.
 - `control_flow` exposes structured region candidates such as `natural_loop`, `if_else_candidate`, and `switch_candidate` with block evidence, loop induction metadata, switch table/default/range metadata, signedness, index expressions, and confidence.
 - `abi` exposes Microsoft x64 shadow-space assumptions, home-slot evidence, frame/prolog/epilog recognition, no-return call evidence, tail-call candidates, thunk candidates, import-wrapper candidates, and recovered call arguments from registers and stack stores.
@@ -688,8 +691,9 @@ Example `/view:json` response details:
 - Known Win32/NT/Rtl API summaries describe memory copy/fill/zero, allocation, release, status, and error behavior when symbol names are available.
 - Prompt facts include `analyzer_skeleton` and `graph_summary` so the model refines an evidence-backed draft instead of starting from a blank page.
 - `graph_summary` provides entry block, control-flow regions, normalized conditions, and representative high-signal blocks with an explicit truncation policy. Prompt fact selection now ranks high-signal entries and uses spread sampling to keep large fact sets representative.
+- `evidence_graph` exposes high-signal fact nodes and provenance edges so IR values, block value states, memory accesses, call targets, type hints, PDB hints, and observed behavior can be traced back to instruction and block evidence.
 - The verifier response includes legacy `warnings` plus structured `issues` entries. Each issue carries `severity`, `code`, `message`, and optional `evidence` so tools can filter errors such as `branch.true_target_not_successor` separately from lower-risk warnings.
-- Verifier checks now compare normalized branch true/false targets against CFG successors, compare pseudo-code branch density against recovered conditional branches, and cross-check direct callee summaries against pseudo-code call effects.
+- Verifier checks now compare normalized branch true/false targets against CFG successors, compare pseudo-code branch density against recovered conditional branches, cross-check direct callee summaries against pseudo-code call effects, validate evidence-graph node/edge grounding, and check block value state references back to recovered blocks and IR values.
 - In LLM mode, the extension automatically feeds verifier issues back into one retry prompt. The retry is kept when it preserves or improves verifier quality; otherwise the original response is retained with an added uncertainty note.
 - `session_policy` and `observed_behavior` expose WinDbg-specific context such as live/dump/kernel/TTD-like policy, current-frame register argument samples, memory hotspots, and suggested trace queries.
 - The serialized request now also includes a `pdb` object when symbol/type data is available.
@@ -725,8 +729,8 @@ Optional environment overrides:
 Quality-first note:
 
 - The extension now supports chunked multi-pass analysis for large functions.
-- The analyzer sends IR value facts, control-flow regions, and x64 ABI/no-return evidence to the LLM before refinement, so `/view:analyzer`, `/view:json`, and normal LLM mode all share the same P0 evidence base.
-- The verifier cross-checks loop, switch, no-return, branch targets, return behavior, callee call effects, evidence coverage, and suspicious identifier claims against analyzer evidence. It lowers trust when confident prose outruns recovered facts and labels each issue with a stable severity/code pair.
+- The analyzer sends IR value facts, block value states, control-flow regions, evidence graph facts, and x64 ABI/no-return evidence to the LLM before refinement, so `/view:analyzer`, `/view:json`, and normal LLM mode all share the same P0 evidence base.
+- The verifier cross-checks loop, switch, no-return, branch targets, return behavior, callee call effects, evidence graph grounding, block value state consistency, evidence coverage, and suspicious identifier claims against analyzer evidence. It lowers trust when confident prose outruns recovered facts and labels each issue with a stable severity/code pair.
 - When verifier feedback finds schema errors, fact conflicts, or very low adjusted confidence, the LLM path performs one automatic retry with the verifier issues appended to the prompt.
 - A good starting point for cloud models is `max_completion_tokens=4000`, `chunk_completion_tokens=3500`, and `merge_completion_tokens=9000`, with chunk triggers around `512 instructions` or `24 blocks`.
 - Keep `timeout_ms` high for cloud models. `120000` is a safer starting point than `15000`.

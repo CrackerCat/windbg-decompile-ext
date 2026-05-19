@@ -38,6 +38,51 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 - 인터프로시저 요약 부족
 - WinDbg data model / DML / TTD와의 UX 통합 부족
 
+## 2026-05-19 분석 강화 Wave
+
+이번 wave의 판단은 "새 분석 파이프라인을 만들지 않고, 기존 `AnalysisFacts` 표면을 더 촘촘하게 연결한다"는 것이다.
+현재 facts는 이미 많지만, 서로 다른 fact가 같은 instruction/block/source에서 왔는지 verifier와 prompt가 공통 방식으로 추적하기 어렵다.
+따라서 1차 구현은 `EvidenceGraph` 기반을 깔고, 2차 구현은 block-level reaching definition을 같은 fact/provenance 표면에 연결했다.
+이후 alias/type/region/TTD 강화는 이 그래프와 block value state 위에 얹는 순서로 진행한다.
+
+우선순위:
+
+1. `EvidenceGraph` 기반 도입
+   - instruction, basic block, IR value, memory access, recovered argument/local, call argument, control-flow region, type hint, idiom, callee summary, data reference, call target, normalized condition, PDB, observed behavior fact를 공통 node/edge로 묶는다.
+   - 각 semantic node는 가능한 경우 `site`, `block_id`, `confidence`를 가진다.
+   - verifier는 graph node/edge가 실제 block/node에 연결되는지 점검한다.
+   - prompt는 전체 fact dump와 별도로 high-signal evidence graph subset을 받는다.
+   - 2026-05-19 1차 구현 및 리뷰 완료: analyzer/protocol/prompt/verifier/data-model/snapshot test 경계까지 연결했다.
+
+2. Reaching Definition + Memory/Stack Alias 강화
+   - block별 live-in/live-out register/stack-slot state를 명시화한다.
+   - `ir_values`, `value_merges`, `call_arguments`, `memory_accesses`를 graph edge로 더 강하게 연결한다.
+   - dead-store, stale stack argument, call-clobber, partial register write 회귀를 verifier rule로 확장한다.
+   - 2026-05-19 2차 구현: `block_value_states`로 per-block live-in/live-out reaching definitions를 노출하고 `evidence_graph`에 `live_in`/`live_out` edge를 추가했다.
+   - 리뷰 후 `block_value_states` prompt truncation wiring과 verifier confidence penalty 회귀 테스트까지 보강했다.
+
+3. Region Tree 기반 CFG structuring
+   - `control_flow`를 후보 목록에서 region tree로 승격한다.
+   - `if_else`, `natural_loop`, `switch`, `break`, `continue`, `irreducible`을 동일 구조에서 표현한다.
+   - 실패한 구조화는 보기 좋은 pseudocode로 덮지 말고 `irreducible_region`과 uncertainty로 남긴다.
+
+4. Type Constraint Solver
+   - PDB, prototype, memory width, field offset, enum compare, bitflag test, vtable access를 타입 제약으로 모은다.
+   - `/fix:type`, `/fix:field`, private PDB는 높은 confidence 제약으로 취급하고, 휴리스틱은 낮은 confidence 제약으로 취급한다.
+   - 충돌은 overwrite하지 말고 `type_conflicts`와 verifier issue로 노출한다.
+
+5. Persistent Callee Summary Cache
+   - module identity, RVA, bytes hash 기준으로 callee summary를 캐시한다.
+   - return behavior, no-return, parameter roles, memory effects, ownership, touched globals를 우선 저장한다.
+
+6. TTD evidence 승격
+   - 현재 query suggestion에서 끝나는 TTD 정보를 선택적으로 실행 가능한 observed evidence로 승격한다.
+   - call argument/return sample, branch frequency, memory write hotspot을 static facts와 병합한다.
+
+7. Verifier 2.0
+   - pseudo token 수준을 넘어 lightweight pseudo AST를 도입한다.
+   - use-before-def, dead-store, call arity, side-effect coverage, return path, region edge coverage를 graph 기반으로 검증한다.
+
 ## 제품 비전
 
 이 프로젝트는 범용 오프라인 디컴파일러를 새로 만드는 것보다, 아래 조합을 강점으로 삼는 것이 가장 현실적이다.
@@ -61,16 +106,22 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 
 - 2026-04-25 기준 P0 초기 구현 완료
 - 2026-05-03 기준 P0 품질 고도화 반영
+- 2026-05-19 기준 `evidence_graph` 기반 1차 구현 및 리뷰 완료
+- 2026-05-19 기준 `block_value_states` 기반 2차 reaching-definition 표면 구현 및 리뷰 완료
 - 새 analyzer facts: `ir_values`, `control_flow`, `abi`
 - 추가 analyzer facts: `stack_pointer`, `call_arguments`, structured `prototype_parameters`
+- 추가 dataflow facts: `block_value_states` live-in/live-out reaching definitions
+- 새 graph facts: high-signal analyzer/PDB/observed facts를 node/edge로 연결하는 `evidence_graph`
 - 새 no-return override: `DECOMP_NORETURN_OVERRIDES`
 - 새 verifier check: loop/switch/no-return/call argument/evidence grounding claim과 analyzer evidence 대조
-- README 반영 완료
+- 새 verifier check: `evidence_graph` node block grounding, edge endpoint consistency, `block_value_states` block/IR reference, unconverged dataflow uncertainty 점검
+- README, ROADMAP, snapshot regression test 반영 완료
 
 남은 방향:
 
-- 현재 구현은 "구조화된 evidence를 안정적으로 만들고 LLM/verifier에 전달하는 1차 기반"이다.
+- 현재 구현은 "구조화된 evidence와 block-level reaching state를 안정적으로 만들고 LLM/verifier에 전달하는 기반"이다.
 - 다음 단계는 더 강한 alias/type propagation, post-dominator 기반 region tree, unwind metadata 심화 해석, 더 넓은 실제 바이너리 corpus 회귀 테스트다.
+- 2026-05-19 wave 이후에는 `EvidenceGraph`를 중심으로 fact 간 provenance와 verifier rule을 확장한다.
 
 #### 1) 내부 IR/SSA 계층 도입
 
@@ -93,10 +144,12 @@ P0 분석 코어의 초기 구현은 들어갔지만, 다음 영역은 아직 �
 
 남은 고도화:
 
-- block 간 reaching definition 전파
 - memory alias와 stack-slot overlap 처리
+- partial register / flag / call-clobber precision 강화
 - phi/merge 표현을 `value_merges`와 더 강하게 연결
 - dead-store verifier rule 추가
+- `evidence_graph` edge로 IR value, memory access, call argument, merge provenance를 더 조밀하게 연결
+- `block_value_states`의 live-in/live-out state를 alias/type propagation의 입력으로 승격
 
 기대 효과:
 

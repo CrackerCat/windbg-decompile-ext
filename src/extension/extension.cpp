@@ -5810,6 +5810,9 @@ std::string BuildDataModelSnapshotJson(
     json += "  \"type_hints\": " + std::to_string(request.Facts.TypeHints.size()) + ",\n";
     json += "  \"idioms\": " + std::to_string(request.Facts.Idioms.size()) + ",\n";
     json += "  \"callee_summaries\": " + std::to_string(request.Facts.CalleeSummaries.size()) + ",\n";
+    json += "  \"block_value_states\": " + std::to_string(request.Facts.BlockValueStates.size()) + ",\n";
+    json += "  \"evidence_graph_nodes\": " + std::to_string(request.Facts.EvidenceGraph.Nodes.size()) + ",\n";
+    json += "  \"evidence_graph_edges\": " + std::to_string(request.Facts.EvidenceGraph.Edges.size()) + ",\n";
     json += "  \"observed_arguments\": " + std::to_string(request.Facts.ObservedBehavior.ArgumentSamples.size()) + ",\n";
     json += "  \"memory_hotspots\": " + std::to_string(request.Facts.ObservedBehavior.MemoryHotspots.size()) + ",\n";
     json += "  \"ttd_queries\": " + std::to_string(request.Facts.ObservedBehavior.TtdQueries.size()) + ",\n";
@@ -6710,6 +6713,7 @@ extern "C" HRESULT CALLBACK DecompCommand(PDEBUG_CLIENT client, PCSTR args)
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "collecting observed behavior facts");
         CollectObservedBehaviorFacts(api.Registers.Get(), api.DataSpaces.Get(), api.Symbols.Get(), regions, request.Facts);
         ApplyPreferredNaturalLanguage(displayConfig, request.Facts);
+        decomp::RefreshEvidenceGraph(request.Facts);
         OutputVerbose(api.Control.Get(), api.Control4.Get(), options, "facts ready pre_llm_confidence=%.2f type_hints=%llu idioms=%llu callee_summaries=%llu", request.Facts.PreLlmConfidence, static_cast<unsigned long long>(request.Facts.TypeHints.size()), static_cast<unsigned long long>(request.Facts.Idioms.size()), static_cast<unsigned long long>(request.Facts.CalleeSummaries.size()));
         OutputProgress(
             api.Control.Get(),

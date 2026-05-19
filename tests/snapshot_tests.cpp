@@ -60,6 +60,19 @@ bool ContainsString(const std::vector<std::string>& values, const std::string& v
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
+bool ContainsReachingValueName(const std::vector<decomp::ReachingValue>& values, const std::string& name)
+{
+    for (const decomp::ReachingValue& value : values)
+    {
+        if (value.Name == name)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 const decomp::ControlFlowRegion* FindRegion(const decomp::AnalysisFacts& facts, const std::string& kind)
 {
     for (const decomp::ControlFlowRegion& region : facts.ControlFlow)
@@ -732,13 +745,67 @@ void TestAnalyzerSnapshot()
     Expect(branch != nullptr && ContainsString(branch->ExitBlocks, "bb3"), "if/else candidate should use post-dominator join bb3");
     Expect(branch != nullptr && branch->Evidence.find("postdominator join") != std::string::npos, "if/else evidence should mention post-dominator join");
 
+    const decomp::BlockValueState* joinState = nullptr;
+
+    for (const decomp::BlockValueState& state : facts.BlockValueStates)
+    {
+        if (state.BlockId == "bb3")
+        {
+            joinState = &state;
+        }
+    }
+
+    Expect(joinState != nullptr, "block value states should include the diamond join block");
+    Expect(joinState != nullptr && joinState->Converged, "block value dataflow should converge for the diamond fixture");
+    Expect(joinState != nullptr && ContainsReachingValueName(joinState->LiveIn, "r10"), "block value state should preserve common reaching register definitions");
+    Expect(joinState != nullptr && !ContainsReachingValueName(joinState->LiveIn, "local_20"), "conflicting stack local definitions should not appear as a single live-in value");
+
+    bool foundEvidenceIrNode = false;
+    bool foundEvidenceBlockState = false;
+    bool foundEvidenceLiveInEdge = false;
+    bool foundEvidenceBlockEdge = false;
+
+    for (const decomp::EvidenceNode& node : facts.EvidenceGraph.Nodes)
+    {
+        if (node.Kind == "ir_value" && node.Site == 0x1020 && node.BlockId == "bb3")
+        {
+            foundEvidenceIrNode = true;
+        }
+        else if (node.Kind == "block_value_state" && node.BlockId == "bb3")
+        {
+            foundEvidenceBlockState = true;
+        }
+    }
+
+    for (const decomp::EvidenceEdge& edge : facts.EvidenceGraph.Edges)
+    {
+        if (edge.Relation == "in_block" && edge.SourceId.find("ir:") == 0 && edge.TargetId == "block:bb3")
+        {
+            foundEvidenceBlockEdge = true;
+        }
+        else if (edge.Relation == "live_in" && edge.TargetId == "block_state:bb3")
+        {
+            foundEvidenceLiveInEdge = true;
+        }
+    }
+
+    Expect(foundEvidenceBlockState, "evidence graph should expose block value state nodes");
+    Expect(foundEvidenceLiveInEdge, "evidence graph should connect reaching definitions to block value states");
+    Expect(foundEvidenceIrNode, "evidence graph should expose IR value nodes with block grounding");
+    Expect(foundEvidenceBlockEdge, "evidence graph should link semantic facts back to basic blocks");
+    Expect(facts.EvidenceGraph.Coverage > 0.0, "evidence graph should report semantic grounding coverage");
+
     const std::string serialized = decomp::SerializeAnalyzeRequest(request, true);
     Expect(serialized.find("\"value_merges\"") != std::string::npos, "request snapshot should serialize value_merges");
     Expect(serialized.find("\"control_flow\"") != std::string::npos, "request snapshot should serialize control_flow");
+    Expect(serialized.find("\"block_value_states\"") != std::string::npos, "request snapshot should serialize block_value_states");
+    Expect(serialized.find("\"evidence_graph\"") != std::string::npos, "request snapshot should serialize evidence_graph");
 
     const std::string promptDump = decomp::BuildDebugPromptDump(request);
     Expect(promptDump.find("\"graph_summary\"") != std::string::npos, "prompt snapshot should include graph_summary");
     Expect(promptDump.find("\"analyzer_skeleton\"") != std::string::npos, "prompt snapshot should include analyzer_skeleton");
+    Expect(promptDump.find("\"block_value_states\"") != std::string::npos, "prompt snapshot should include block_value_states");
+    Expect(promptDump.find("\"evidence_graph\"") != std::string::npos, "prompt snapshot should include evidence_graph");
 }
 
 void TestIrUseSnapshot()
@@ -1528,6 +1595,36 @@ void TestVerifierCoverageSnapshot()
 
     const decomp::VerifyReport lowEvidenceReport = decomp::VerifyResponse(request, lowEvidenceResponse);
     Expect(HasIssueCode(lowEvidenceReport, "evidence.low_coverage"), "verifier should flag high-confidence responses with sparse high-signal evidence coverage");
+
+    decomp::AnalyzeRequest missingGraphRequest = request;
+    missingGraphRequest.Facts.EvidenceGraph = decomp::EvidenceGraphFacts();
+
+    decomp::AnalyzeResponse missingGraphResponse;
+    missingGraphResponse.Status = "ok";
+    missingGraphResponse.PseudoC = "void f(void) { ImportantHelper(1, 2); }";
+    missingGraphResponse.Summary = "calls helper";
+    missingGraphResponse.Confidence = 0.92;
+
+    const decomp::VerifyReport missingGraphReport = decomp::VerifyResponse(missingGraphRequest, missingGraphResponse);
+    Expect(HasIssueCode(missingGraphReport, "evidence_graph.missing"), "verifier should flag high-confidence semantic facts without an evidence graph");
+    Expect(missingGraphReport.AdjustedConfidence < missingGraphResponse.Confidence, "missing evidence graph should reduce verifier confidence");
+
+    decomp::AnalyzeRequest unconvergedRequest = request;
+
+    if (!unconvergedRequest.Facts.BlockValueStates.empty())
+    {
+        unconvergedRequest.Facts.BlockValueStates[0].Converged = false;
+    }
+
+    decomp::AnalyzeResponse unconvergedResponse;
+    unconvergedResponse.Status = "ok";
+    unconvergedResponse.PseudoC = "void f(void) { ImportantHelper(1, 2); }";
+    unconvergedResponse.Summary = "calls helper";
+    unconvergedResponse.Confidence = 0.92;
+
+    const decomp::VerifyReport unconvergedReport = decomp::VerifyResponse(unconvergedRequest, unconvergedResponse);
+    Expect(HasIssueCode(unconvergedReport, "dataflow.unconverged_without_uncertainty"), "verifier should flag confident responses that omit unconverged dataflow uncertainty");
+    Expect(unconvergedReport.AdjustedConfidence < unconvergedResponse.Confidence, "unconverged dataflow without uncertainty should reduce verifier confidence");
 }
 }
 
